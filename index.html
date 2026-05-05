@@ -285,6 +285,100 @@
             opacity: 0.5;
             cursor: not-allowed;
         }
+
+        /* Лог-панель */
+        .log-container {
+            display: flex;
+            flex-direction: column;
+            height: 160px;
+            border-top: 1px solid #1e2329;
+            background: #0f1318;
+            transition: height 0.15s;
+        }
+
+        .log-container.collapsed {
+            height: 28px;
+        }
+
+        .log-container.collapsed .log-panel {
+            display: none;
+        }
+
+        .log-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 12px;
+            background: #151a20;
+            border-bottom: 1px solid #1e2329;
+            font-size: 11px;
+            color: #848e9c;
+            user-select: none;
+        }
+
+        .log-header-title {
+            font-weight: 600;
+            color: #d1d4dc;
+        }
+
+        .log-header-spacer {
+            flex: 1;
+        }
+
+        .log-btn {
+            background: transparent;
+            border: 1px solid #2b3139;
+            color: #848e9c;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        .log-btn:hover {
+            color: #d1d4dc;
+            border-color: #3a4047;
+        }
+
+        .log-panel {
+            flex: 1;
+            overflow-y: auto;
+            padding: 6px 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+
+        .log-panel::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .log-panel::-webkit-scrollbar-thumb {
+            background: #2b3139;
+            border-radius: 2px;
+        }
+
+        .log-line {
+            color: #d1d4dc;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .log-time {
+            color: #5d6068;
+        }
+
+        .log-level {
+            color: #848e9c;
+        }
+
+        .log-info .log-level { color: #5b8def; }
+        .log-ws .log-level { color: #0ecb81; }
+        .log-liq .log-level { color: #f0b90b; }
+        .log-warn .log-level { color: #f0b90b; }
+        .log-error { color: #f6465d; }
+        .log-error .log-level { color: #f6465d; }
+        .log-chart_init .log-level { color: #c97cff; }
     </style>
 </head>
 <body>
@@ -309,6 +403,15 @@
                 <span class="connection-status status-disconnected" id="connStatus">Disconnected</span>
             </div>
             <div class="chart-container" id="chart"></div>
+            <div class="log-container" id="logContainer">
+                <div class="log-header">
+                    <span class="log-header-title">Логи</span>
+                    <span class="log-header-spacer"></span>
+                    <button class="log-btn" id="logClearBtn" title="Очистить">Очистить</button>
+                    <button class="log-btn" id="logToggleBtn" title="Свернуть/развернуть">▼</button>
+                </div>
+                <div class="log-panel" id="logPanel"></div>
+            </div>
         </div>
 
         <!-- Скринер -->
