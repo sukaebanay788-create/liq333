@@ -1,4 +1,4 @@
-// Binance Futures Screener (исправлены прыжки шкалы при real-time обновлениях)
+// Binance Futures Screener — KLineChart edition
 const BINANCE_WS = 'wss://fstream.binance.com/ws';
 const BINANCE_API = 'https://fapi.binance.com';
 
@@ -7,10 +7,6 @@ let filteredCoins = [];
 let currentSymbol = 'BTCUSDT';
 let ws = null;
 let chart = null;
-let candleSeries = null;
-let ema65Series = null;
-let ema125Series = null;
-let ema450Series = null;
 let sortField = 'change';
 let sortDesc = true;
 let currentTimeframe = '15m';
@@ -24,14 +20,13 @@ let isLoadingMore = false;
 
 // ---------- Ликвидации ----------
 let liquidationWs = null;
-let liquidationMarkers = [];
 const MAX_MARKERS_PER_SYMBOL = 500;
 const MIN_VOLUME_USD = 5000;
 const MIN_VOLUME_BTC = 100000;
 let liquidationCount = 0;
 
 const allLiquidations = new Map();
-const STORAGE_PREFIX = 'binance_liq_';
+const STORAGE_PREFIX = 'binance_liq_kc_';
 
 let recentLiquidations = [];
 const MAX_RECENT = 20;
@@ -61,9 +56,9 @@ async function loadCoins() {
     try {
         const exchangeInfoRes = await fetch(`${BINANCE_API}/fapi/v1/exchangeInfo`);
         const exchangeData = await exchangeInfoRes.json();
-        
-        const usdtPairs = exchangeData.symbols.filter(s => 
-            s.quoteAsset === 'USDT' && 
+
+        const usdtPairs = exchangeData.symbols.filter(s =>
+            s.quoteAsset === 'USDT' &&
             s.status === 'TRADING' &&
             s.contractType === 'PERPETUAL'
         );
@@ -120,73 +115,164 @@ async function loadCoins() {
     }
 }
 
-// График
+// ---------- График (KLineChart) ----------
 function initChart() {
-    const container = document.getElementById('chart');
-    chart = LightweightCharts.createChart(container, {
-        layout: { background: { color: '#0b0e11' }, textColor: '#d1d4dc' },
-        grid: { vertLines: { color: '#1e2329' }, horzLines: { color: '#1e2329' } },
-        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-        rightPriceScale: { borderColor: '#1e2329', autoScale: true, scaleMargins: { top: 0.02, bottom: 0.02 } },
-        timeScale: { borderColor: '#1e2329', timeVisible: true },
+    // Кастомный индикатор: тройная EMA (65, 125, 450)
+    klinecharts.registerIndicator({
+        name: 'EMA_TRIPLE',
+        shortName: 'EMA',
+        calcParams: [65, 125, 450],
+        figures: [
+            { key: 'ema65', title: 'EMA65: ', type: 'line' },
+            { key: 'ema125', title: 'EMA125: ', type: 'line' },
+            { key: 'ema450', title: 'EMA450: ', type: 'line' },
+        ],
+        styles: {
+            lines: [
+                { color: '#a0a4ab', size: 1 },
+                { color: '#a0a4ab', size: 1 },
+                { color: '#e0e3e8', size: 2 },
+            ],
+        },
+        calc: (kLineDataList, indicator) => {
+            const params = indicator.calcParams || [65, 125, 450];
+            const keys = ['ema65', 'ema125', 'ema450'];
+            const result = kLineDataList.map(() => ({}));
+            params.forEach((period, idx) => {
+                if (kLineDataList.length < period) return;
+                const key = keys[idx];
+                const m = 2 / (period + 1);
+                let sum = 0;
+                for (let i = 0; i < period; i++) sum += kLineDataList[i].close;
+                let prev = sum / period;
+                result[period - 1][key] = prev;
+                for (let i = period; i < kLineDataList.length; i++) {
+                    prev = (kLineDataList[i].close - prev) * m + prev;
+                    result[i][key] = prev;
+                }
+            });
+            return result;
+        },
     });
 
-    candleSeries = chart.addCandlestickSeries({
-        upColor: '#0ecb81', downColor: '#f6465d',
-        borderUpColor: '#0ecb81', borderDownColor: '#f6465d',
-        wickUpColor: '#0ecb81', wickDownColor: '#f6465d',
+    // Кастомный overlay: круглый маркер ликвидации над/под свечой
+    klinecharts.registerOverlay({
+        name: 'liqMarker',
+        totalStep: 1,
+        needDefaultPointFigure: false,
+        needDefaultXAxisFigure: false,
+        needDefaultYAxisFigure: false,
+        createPointFigures: ({ overlay, coordinates }) => {
+            if (!coordinates || coordinates.length === 0) return [];
+            const data = overlay.extendData || {};
+            const color = data.color || '#f6465d';
+            const text = data.text || '';
+            const position = data.position || 'belowBar';
+            const offsetY = position === 'belowBar' ? 8 : -8;
+            const cx = coordinates[0].x;
+            const cy = coordinates[0].y + offsetY;
+            return [
+                {
+                    type: 'circle',
+                    attrs: { x: cx, y: cy, r: 3 },
+                    styles: { style: 'fill', color },
+                },
+                {
+                    type: 'text',
+                    attrs: {
+                        x: cx,
+                        y: cy + (position === 'belowBar' ? 9 : -9),
+                        text,
+                        align: 'center',
+                        baseline: 'middle',
+                    },
+                    styles: { color, size: 9, family: 'Helvetica Neue, sans-serif' },
+                },
+            ];
+        },
     });
 
-    // Отключаем влияние маркеров на автошкалу
-    candleSeries.markers = () => ({
-        autoscaleInfo: () => null,
-        markers: () => [],
+    chart = klinecharts.init('chart', {
+        styles: {
+            grid: {
+                show: true,
+                horizontal: { color: '#1e2329' },
+                vertical: { color: '#1e2329' },
+            },
+            candle: {
+                bar: {
+                    upColor: '#0ecb81',
+                    downColor: '#f6465d',
+                    upBorderColor: '#0ecb81',
+                    downBorderColor: '#f6465d',
+                    upWickColor: '#0ecb81',
+                    downWickColor: '#f6465d',
+                },
+                priceMark: {
+                    last: {
+                        upColor: '#0ecb81',
+                        downColor: '#f6465d',
+                    },
+                },
+                tooltip: {
+                    showRule: 'always',
+                    showType: 'rect',
+                },
+            },
+            xAxis: {
+                axisLine: { color: '#1e2329' },
+                tickLine: { color: '#1e2329' },
+                tickText: { color: '#848e9c' },
+            },
+            yAxis: {
+                axisLine: { color: '#1e2329' },
+                tickLine: { color: '#1e2329' },
+                tickText: { color: '#848e9c' },
+            },
+            crosshair: {
+                horizontal: {
+                    line: { color: '#848e9c' },
+                    text: { backgroundColor: '#2b3139', color: '#fff', borderColor: '#2b3139' },
+                },
+                vertical: {
+                    line: { color: '#848e9c' },
+                    text: { backgroundColor: '#2b3139', color: '#fff', borderColor: '#2b3139' },
+                },
+            },
+            indicator: {
+                tooltip: {
+                    showRule: 'always',
+                    showType: 'rect',
+                },
+            },
+        },
     });
 
-    // Защита от выбросов при автообновлении шкалы
-    candleSeries.priceScale().applyOptions({
-        autoScale: true,
-        mode: 0, // Normal mode
-    });
+    chart.createIndicator('EMA_TRIPLE', true, { id: 'candle_pane' });
 
-    ema65Series = chart.addLineSeries({
-        color: '#a0a4ab', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
-        crosshairMarkerVisible: false, autoscaleInfoProvider: () => null,
-    });
-    ema125Series = chart.addLineSeries({
-        color: '#a0a4ab', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
-        crosshairMarkerVisible: false, autoscaleInfoProvider: () => null,
-    });
-    ema450Series = chart.addLineSeries({
-        color: '#e0e3e8', lineWidth: 2, priceLineVisible: false, lastValueVisible: false,
-        crosshairMarkerVisible: false, autoscaleInfoProvider: () => null,
-    });
-
-    window.addEventListener('resize', () => {
-        chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-    });
+    window.addEventListener('resize', () => chart.resize());
 }
 
-// Подключение к WebSocket ликвидаций
+// ---------- Ликвидации ----------
 function connectLiquidationWebSocket() {
     liquidationWs = new WebSocket(`${BINANCE_WS}/!forceOrder@arr`);
-    
+
     liquidationWs.onopen = () => {
         console.log('Liquidation WebSocket connected');
     };
-    
+
     liquidationWs.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.e === 'forceOrder') {
             processLiquidation(msg.o);
         }
     };
-    
+
     liquidationWs.onclose = () => {
         console.log('Liquidation WebSocket closed, reconnecting...');
         setTimeout(connectLiquidationWebSocket, 5000);
     };
-    
+
     liquidationWs.onerror = (e) => {
         console.error('Liquidation WS error:', e);
     };
@@ -227,7 +313,6 @@ function saveMarkers(symbol, markers) {
     }
 }
 
-// Обновление ленты ликвидаций в UI
 function updateLiquidationFeed() {
     const feedEl = document.getElementById('liquidationFeed');
     if (!feedEl) return;
@@ -254,44 +339,48 @@ function processLiquidation(order) {
     const price = parseFloat(order.p);
     const quantity = parseFloat(order.q);
     const volumeUSD = price * quantity;
-    
+
     console.log(`[Liquidation] ${symbol} ${order.S} ${quantity.toFixed(4)} @ ${price.toFixed(2)} (vol: ${volumeUSD.toFixed(0)} USD)`);
-    
+
     const minVol = symbol === 'BTCUSDT' ? MIN_VOLUME_BTC : MIN_VOLUME_USD;
     if (volumeUSD < minVol) return;
-    
+
     const side = order.S;
     const timeMs = order.T;
     const timeframeMs = getTimeframeMs(currentTimeframe);
     const candleOpenTimeMs = Math.floor(timeMs / timeframeMs) * timeframeMs;
-    const timeSec = Math.floor(candleOpenTimeMs / 1000);
-    
+
     const isLongLiquidation = (side === 'SELL');
-    
+
+    // Определяем value (цена) для размещения маркера у high/low свечи
+    const candle = currentCandles.find(c => c.timestamp === candleOpenTimeMs);
+    const value = candle
+        ? (isLongLiquidation ? candle.low : candle.high)
+        : price;
+
     const marker = {
-        time: timeSec,
+        time: candleOpenTimeMs,
+        value,
         position: isLongLiquidation ? 'belowBar' : 'aboveBar',
         color: side === 'SELL' ? '#f6465d' : '#0ecb81',
-        shape: 'circle',
         text: `${(volumeUSD / 1000).toFixed(0)}K`,
-        size: 1,
     };
-    
+
     recentLiquidations.unshift({
         symbol,
         side,
         volume: volumeUSD,
         price,
-        time: timeMs
+        time: timeMs,
     });
     if (recentLiquidations.length > MAX_RECENT) recentLiquidations.pop();
     updateLiquidationFeed();
-    
+
     if (!allLiquidations.has(symbol)) {
         allLiquidations.set(symbol, loadSavedMarkers(symbol));
     }
     const symbolMarkers = allLiquidations.get(symbol);
-    
+
     const exists = symbolMarkers.some(m => m.time === marker.time && m.text === marker.text);
     if (!exists) {
         symbolMarkers.push(marker);
@@ -300,18 +389,28 @@ function processLiquidation(order) {
         }
         saveMarkers(symbol, symbolMarkers);
     }
-    
+
     if (symbol === currentSymbol) {
-        liquidationMarkers = symbolMarkers;
-        updateMarkersOnChart();
-        liquidationCount = liquidationMarkers.length;
+        addMarkerToChart(marker);
+        liquidationCount = symbolMarkers.length;
         updateStatusWithCount();
     }
 }
 
-function updateMarkersOnChart() {
-    if (!candleSeries) return;
-    candleSeries.setMarkers(liquidationMarkers);
+function addMarkerToChart(marker) {
+    if (!chart) return;
+    chart.createOverlay({
+        name: 'liqMarker',
+        extendData: { color: marker.color, text: marker.text, position: marker.position },
+        points: [{ timestamp: marker.time, value: marker.value }],
+    });
+}
+
+function renderAllMarkers(symbol) {
+    if (!chart) return;
+    chart.removeOverlay({ name: 'liqMarker' });
+    const markers = allLiquidations.get(symbol) || [];
+    markers.forEach(addMarkerToChart);
 }
 
 function updateStatusWithCount() {
@@ -321,63 +420,39 @@ function updateStatusWithCount() {
     }
 }
 
-function calculateEMA(data, period) {
-    if (data.length < period) return [];
-    const ema = [];
-    const multiplier = 2 / (period + 1);
-    let sum = 0;
-    for (let i = 0; i < period; i++) sum += data[i].close;
-    let prevEma = sum / period;
-    ema.push({ time: data[period - 1].time, value: prevEma });
-    for (let i = period; i < data.length; i++) {
-        prevEma = (data[i].close - prevEma) * multiplier + prevEma;
-        ema.push({ time: data[i].time, value: prevEma });
-    }
-    return ema;
-}
-
+// ---------- Загрузка / обновление графика ----------
 async function loadChartData(symbol) {
     try {
         const res = await fetch(
             `${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${currentTimeframe}&limit=1400`
         );
         const klines = await res.json();
-        
+
         currentCandles = klines.map(k => ({
-            time: k[0] / 1000,
-            open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]),
+            timestamp: k[0],
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
         }));
-        
+
         oldestTime = klines.length > 0 ? klines[0][0] : null;
-        
-        candleSeries.setData(currentCandles);
-        updateEmaLines(currentCandles);
-        chart.timeScale().fitContent();
-        
-        // Принудительно сбрасываем масштаб после загрузки истории
-        const priceScale = candleSeries.priceScale();
-        priceScale.applyOptions({ autoScale: true });
-        
+
+        chart.applyNewData(currentCandles);
+
         if (!allLiquidations.has(symbol)) {
             allLiquidations.set(symbol, loadSavedMarkers(symbol));
         }
-        liquidationMarkers = allLiquidations.get(symbol) || [];
-        updateMarkersOnChart();
-        liquidationCount = liquidationMarkers.length;
+        renderAllMarkers(symbol);
+        liquidationCount = (allLiquidations.get(symbol) || []).length;
         updateStatusWithCount();
-        
+
         if (wsReady) subscribeToKlineStream(symbol);
         updateHeader(symbol);
     } catch (e) {
         console.error('Ошибка загрузки графика:', e);
     }
-}
-
-function updateEmaLines(candles) {
-    if (candles.length === 0) return;
-    ema65Series.setData(calculateEMA(candles, 65));
-    ema125Series.setData(calculateEMA(candles, 125));
-    ema450Series.setData(calculateEMA(candles, 450));
 }
 
 async function loadMoreHistory() {
@@ -392,24 +467,27 @@ async function loadMoreHistory() {
         const klines = await res.json();
         if (klines.length === 0) return;
         const newCandles = klines.map(k => ({
-            time: k[0] / 1000,
-            open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: parseFloat(k[4]),
+            timestamp: k[0],
+            open: parseFloat(k[1]),
+            high: parseFloat(k[2]),
+            low: parseFloat(k[3]),
+            close: parseFloat(k[4]),
+            volume: parseFloat(k[5]),
         }));
         oldestTime = klines[0][0];
         currentCandles = [...newCandles, ...currentCandles];
-        candleSeries.setData(currentCandles);
-        updateEmaLines(currentCandles);
-        updateMarkersOnChart();
-        // Не сбрасываем масштаб при подгрузке истории
+        chart.applyNewData(currentCandles);
+        renderAllMarkers(currentSymbol);
     } catch (e) {
         console.error('Ошибка подгрузки истории:', e);
     } finally {
-        btn.textContent = '📜';
+        btn.textContent = '📜 Ещё';
         btn.disabled = false;
         isLoadingMore = false;
     }
 }
 
+// ---------- WebSocket тикер + клайн ----------
 function connectWebSocket() {
     ws = new WebSocket(BINANCE_WS);
     ws.onopen = () => {
@@ -441,7 +519,7 @@ function updateSubscriptions() {
     lastSubscriptionSet.forEach(sym => { if (!target.has(sym)) toUnsub.push(`${sym}@ticker`); });
     target.forEach(sym => { if (!lastSubscriptionSet.has(sym)) toSub.push(`${sym}@ticker`); });
     if (toUnsub.length) ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: toUnsub, id: Date.now() }));
-    if (toSub.length) ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: toSub, id: Date.now()+1 }));
+    if (toSub.length) ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: toSub, id: Date.now() + 1 }));
     lastSubscriptionSet = target;
 }
 
@@ -450,7 +528,7 @@ function subscribeToKlineStream(symbol) {
     if (currentKlineSymbol && currentKlineSymbol !== symbol) {
         ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: [`${currentKlineSymbol.toLowerCase()}@kline_${currentTimeframe}`], id: Date.now() }));
     }
-    ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: [`${symbol.toLowerCase()}@kline_${currentTimeframe}`], id: Date.now()+1 }));
+    ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: [`${symbol.toLowerCase()}@kline_${currentTimeframe}`], id: Date.now() + 1 }));
     currentKlineSymbol = symbol;
 }
 
@@ -467,42 +545,38 @@ function updateTicker(data) {
 
 function updateChartWithKline(data) {
     const k = data.k;
-    const candleTime = k.t / 1000;
+    const candleTime = k.t;
     const newCandle = {
-        time: candleTime,
+        timestamp: candleTime,
         open: parseFloat(k.o),
         high: parseFloat(k.h),
         low: parseFloat(k.l),
-        close: parseFloat(k.c)
+        close: parseFloat(k.c),
+        volume: parseFloat(k.v),
     };
-    
-    // Простая фильтрация выбросов: если high/low слишком далеко от предыдущих значений — игнорируем обновление
+
+    // Простая фильтрация выбросов: если high/low слишком далеко от предыдущих значений — игнорируем
     const lastCandle = currentCandles.length > 0 ? currentCandles[currentCandles.length - 1] : null;
-    
+
     if (!lastCandle) {
         currentCandles = [newCandle];
-        candleSeries.setData(currentCandles);
-    } else if (candleTime === lastCandle.time) {
-        // Обновляем текущую свечу, но с проверкой на реалистичность
+        chart.applyNewData(currentCandles);
+        return;
+    }
+
+    if (candleTime === lastCandle.timestamp) {
         const prevHigh = lastCandle.high;
         const prevLow = lastCandle.low;
         if (newCandle.high > prevHigh * 1.5 || newCandle.low < prevLow * 0.5) {
-            // Вероятно выброс, игнорируем это обновление
             return;
         }
         Object.assign(lastCandle, newCandle);
-        candleSeries.update(newCandle);
-    } else if (candleTime > lastCandle.time) {
+        chart.updateData(newCandle);
+    } else if (candleTime > lastCandle.timestamp) {
         currentCandles.push(newCandle);
         if (currentCandles.length > 1000) currentCandles.shift();
-        candleSeries.update(newCandle);
+        chart.updateData(newCandle);
     }
-    
-    // Обновляем EMA
-    updateEmaLines(currentCandles);
-    
-    // НЕ вызываем автоматический пересчёт масштаба при каждом обновлении
-    // Это устраняет прыжки
 }
 
 function updateHeader(symbol) {
@@ -607,7 +681,6 @@ function updateCoinRow(coin) {
 
 function selectCoin(symbol) {
     currentSymbol = symbol;
-    
     document.querySelectorAll('.coin-item').forEach(el => {
         el.classList.toggle('active', el.dataset.symbol === symbol);
     });

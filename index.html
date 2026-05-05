@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto Futures Screener</title>
-    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <title>Crypto Futures Screener (KLineChart)</title>
+    <script src="https://cdn.jsdelivr.net/npm/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -71,6 +71,7 @@
         .chart-container {
             flex: 1;
             position: relative;
+            background: #0b0e11;
         }
 
         /* Правая часть - скринер */
@@ -262,7 +263,7 @@
             color: #0b0e11;
             font-weight: 600;
         }
-        
+
         #loadMoreBtn {
             margin-left: 8px;
             background: #0b0e11;
@@ -274,12 +275,12 @@
             cursor: pointer;
             transition: all 0.15s;
         }
-        
+
         #loadMoreBtn:hover {
             border-color: #2b3139;
             color: #d1d4dc;
         }
-        
+
         #loadMoreBtn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
