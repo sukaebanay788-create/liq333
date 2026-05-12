@@ -2,7 +2,7 @@ const klinecharts = window.klinecharts;
 
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
 const BINANCE_API = 'https://fapi.binance.com';
-const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws';  // Для отдельных kline-стримов
+const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws';
 
 const MIN_VOLUME_BTC = 100000;
 const MIN_VOLUME_ETH = 50000;
@@ -38,9 +38,9 @@ const state = {
   currentSymbol: 'BTCUSDT',
   ws: null,
   wsReady: false,
-  wsChart: null,              // Отдельный WebSocket для kline
-  liquidationWs: null,
   chartInstance: null,
+  wsChart: null,
+  liquidationWs: null,
   sortField: 'change',
   sortDesc: true,
   currentTimeframe: '15m',
@@ -51,6 +51,7 @@ const state = {
   liquidationCount: 0,
   allLiquidations: new Map(),
   recentLiquidations: [],
+  currentCandles: [],
 };
 
 function updateHeader(stateObj) {
@@ -167,7 +168,7 @@ async function init() {
   connectWebSocket();
   connectLiquidationWebSocket();
   setupEvents();
-  loadChartData(state.currentSymbol);
+  loadChart(state.currentSymbol, state.currentTimeframe);
 }
 
 async function loadCoins() {
@@ -233,7 +234,11 @@ async function loadCoins() {
   }
 }
 
+// ---------- ГРАФИК: ИНИЦИАЛИЗАЦИЯ / УНИЧТОЖЕНИЕ ----------
 function initChart() {
+  if (state.chartInstance && typeof state.chartInstance.destroy === 'function') {
+    state.chartInstance.destroy();
+  }
   const container = document.getElementById('chart');
   state.chartInstance = klinecharts.init(container, {
     styles: {
@@ -251,114 +256,137 @@ function initChart() {
       }
     }
   });
-
-  window.addEventListener('resize', () => {
-    if (state.chartInstance && container) {
-      state.chartInstance.resize();
-    }
-  });
 }
 
-function connectLiquidationWebSocket() {
-  state.liquidationWs = new WebSocket(`${BINANCE_WS_MARKET}/!forceOrder@arr`);
+window.addEventListener('resize', () => {
+  if (state.chartInstance && typeof state.chartInstance.resize === 'function') {
+    state.chartInstance.resize();
+  }
+});
 
-  state.liquidationWs.onopen = () => console.log('Liquidation WebSocket connected');
-  state.liquidationWs.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.e === 'forceOrder') processLiquidation(msg.o);
-  };
-  state.liquidationWs.onclose = () => {
-    console.log('Liquidation WebSocket closed, reconnecting...');
-    setTimeout(connectLiquidationWebSocket, 5000);
-  };
-  state.liquidationWs.onerror = (e) => console.error('Liquidation WS error:', e);
+// ---------- ЗАГРУЗКА ИСТОРИИ ----------
+async function fetchHistory(symbol, interval, limit, signal) {
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const resp = await fetch(url, { signal });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const raw = await resp.json();
+  return raw.map(d => ({
+    timestamp: d[0],
+    open: parseFloat(d[1]),
+    high: parseFloat(d[2]),
+    low: parseFloat(d[3]),
+    close: parseFloat(d[4]),
+    volume: parseFloat(d[5])
+  }));
 }
 
-function processLiquidation(order) {
-  const symbol = order.s;
-  const price = parseFloat(order.p);
-  const quantity = parseFloat(order.q);
-  const volumeUSD = price * quantity;
+// ---------- ОСНОВНАЯ ЗАГРУЗКА ГРАФИКА (создаётся заново) ----------
+let currentFetchController = null;
 
-  let minVol = MIN_VOLUME_USD;
-  if (symbol === 'BTCUSDT') minVol = MIN_VOLUME_BTC;
-  else if (symbol === 'ETHUSDT') minVol = MIN_VOLUME_ETH;
-  if (volumeUSD < minVol) return;
-
-  const side = order.S;
-  console.log(`Ликвидация: ${symbol} ${side} ${volumeUSD.toFixed(0)} USD (цена ${price})`);
-
-  state.recentLiquidations.unshift({ symbol, side, volume: volumeUSD, price, time: order.T });
-  if (state.recentLiquidations.length > MAX_RECENT) state.recentLiquidations.pop();
-  updateLiquidationFeed(state, selectCoin);
-
-  state.liquidationCount++;
-  updateStatusWithCount(state);
-}
-
-// ---------- Управление отдельным kline-соединением ----------
-function closeChartWebSocket() {
+async function loadChart(symbol, interval) {
+  // Закрываем старый kline-сокет
   if (state.wsChart) {
-    state.wsChart.onclose = null;  // отключаем автопереподключение
+    state.wsChart.onclose = null;
     state.wsChart.close();
     state.wsChart = null;
   }
+  // Отменяем предыдущую загрузку, если есть
+  if (currentFetchController) currentFetchController.abort();
+  currentFetchController = new AbortController();
+  const { signal } = currentFetchController;
+
+  try {
+    const history = await fetchHistory(symbol, interval, 500, signal);
+    if (signal.aborted) return;
+
+    state.currentCandles = history;
+    state.oldestTime = history.length > 0 ? history[0].timestamp : null;
+
+    // Пересоздаём график
+    initChart();
+
+    state.chartInstance.applyNewData(history);
+
+    // Настройка точности
+    const lastPrice = history.length ? history[history.length - 1].close : 0;
+    const precision = getPricePrecision(lastPrice);
+    state.chartInstance.setPriceVolumePrecision(precision, 2);
+    state.chartInstance.resize();
+
+    // Подключаем kline-сокет
+    connectChartWebSocket(symbol, interval);
+
+    updateHeader(state);
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    console.error('Ошибка загрузки графика:', err);
+    setTimeout(() => {
+      if (state.currentSymbol === symbol && state.currentTimeframe === interval) {
+        loadChart(symbol, interval);
+      }
+    }, 3000);
+  }
 }
 
+// ---------- WEB SOCKET для свечей (с автопереподключением) ----------
 function connectChartWebSocket(symbol, interval) {
-  closeChartWebSocket(); // гарантированно закрываем предыдущее
+  if (state.wsChart) {
+    state.wsChart.onclose = null;
+    state.wsChart.close();
+  }
 
-  const wsUrl = `${BINANCE_WS_BASE}/${symbol.toLowerCase()}@kline_${interval}`;
+  const wsUrl = `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${interval}`;
   state.wsChart = new WebSocket(wsUrl);
 
-  state.wsChart.onopen = () => console.log('Kline WebSocket открыт');
+  state.wsChart.onopen = () => console.log('Kline WebSocket opened');
   state.wsChart.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.e === 'kline') updateChartWithKline(msg);
+    if (msg.e === 'kline') {
+      updateChartWithKline(msg);
+    }
   };
   state.wsChart.onclose = () => {
-    console.log('Kline WebSocket закрыт');
-    // Не переподключаемся здесь — новая подписка создастся при следующей загрузке
+    console.log('Kline WebSocket closed, reconnecting...');
+    setTimeout(() => {
+      // Переподключаемся только если символ и интервал не изменились
+      if (state.currentSymbol === symbol && state.currentTimeframe === interval) {
+        connectChartWebSocket(symbol, interval);
+      }
+    }, 3000);
   };
   state.wsChart.onerror = (e) => console.error('Kline WS error:', e);
 }
 
-// ---------- Загрузка данных ----------
-async function loadChartData(symbol) {
-  try {
-    const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${state.currentTimeframe}&limit=1400`);
-    const klines = await res.json();
+// ---------- ОБНОВЛЕНИЕ СВЕЧЕЙ В РЕАЛЬНОМ ВРЕМЕНИ ----------
+function updateChartWithKline(msg) {
+  const k = msg.k;
+  const candle = {
+    timestamp: k.t,
+    open: parseFloat(k.o),
+    high: parseFloat(k.h),
+    low: parseFloat(k.l),
+    close: parseFloat(k.c),
+    volume: parseFloat(k.v)
+  };
 
-    const candles = klines.map((k) => ({
-      timestamp: k[0],
-      open: parseFloat(k[1]),
-      high: parseFloat(k[2]),
-      low: parseFloat(k[3]),
-      close: parseFloat(k[4]),
-      volume: parseFloat(k[5])
-    }));
+  if (!state.currentCandles.length) {
+    state.currentCandles.push(candle);
+    state.chartInstance.applyNewData([candle]);
+    return;
+  }
 
-    state.currentCandles = candles;
-    state.oldestTime = klines.length > 0 ? klines[0][0] : null;
+  const last = state.currentCandles[state.currentCandles.length - 1];
 
-    if (state.chartInstance) {
-      // Динамически устанавливаем точность цены
-      const lastPrice = candles.length ? candles[candles.length - 1].close : 0;
-      const precision = getPricePrecision(lastPrice);
-
-      state.chartInstance.applyNewData(candles);
-      state.chartInstance.setPriceVolumePrecision(precision, 2);
-      state.chartInstance.resize();
-    }
-
-    // Подключаем выделенный kline-WebSocket для этого symbol/interval
-    connectChartWebSocket(symbol, state.currentTimeframe);
-    updateHeader(state);
-  } catch (e) {
-    console.error('Ошибка загрузки графика:', e);
+  if (candle.timestamp === last.timestamp) {
+    state.currentCandles[state.currentCandles.length - 1] = candle;
+    state.chartInstance.updateData(candle);
+  } else if (candle.timestamp > last.timestamp) {
+    state.currentCandles.push(candle);
+    state.chartInstance.applyMoreData([candle]);
   }
 }
 
+// ---------- ДОЗАГРУЗКА ИСТОРИИ ----------
 async function loadMoreHistory() {
   if (state.isLoadingMore || !state.oldestTime) return;
   state.isLoadingMore = true;
@@ -397,6 +425,7 @@ async function loadMoreHistory() {
   }
 }
 
+// ---------- ОСНОВНОЙ WEB SOCKET (ТИКЕРЫ) ----------
 function connectWebSocket() {
   state.ws = new WebSocket(BINANCE_WS_MARKET);
 
@@ -404,14 +433,12 @@ function connectWebSocket() {
     state.wsReady = true;
     updateConnectionStatus(state, true);
     updateSubscriptions();
-    // Запускаем kline-подписку отдельно в loadChartData
   };
 
   state.ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     if (msg.id) return;
     if (msg.e === '24hrTicker') updateTicker(msg);
-    // kline-сообщения больше не обрабатываем здесь — у нас свой WebSocket
   };
 
   state.ws.onclose = () => {
@@ -452,35 +479,45 @@ function updateTicker(data) {
   if (idx !== -1) updateCoinRow(coin);
 }
 
-// ---------- Обновление свечей (только из выделенного kline-соединения) ----------
-function updateChartWithKline(data) {
-  const k = data.k;
-  const candle = {
-    timestamp: k.t,
-    open: parseFloat(k.o),
-    high: parseFloat(k.h),
-    low: parseFloat(k.l),
-    close: parseFloat(k.c),
-    volume: parseFloat(k.v)
+// ---------- ЛИКВИДАЦИИ ----------
+function connectLiquidationWebSocket() {
+  state.liquidationWs = new WebSocket(`${BINANCE_WS_MARKET}/!forceOrder@arr`);
+
+  state.liquidationWs.onopen = () => console.log('Liquidation WebSocket connected');
+  state.liquidationWs.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.e === 'forceOrder') processLiquidation(msg.o);
   };
-
-  if (!state.currentCandles.length) {
-    state.currentCandles.push(candle);
-    state.chartInstance.applyNewData([candle]);
-    return;
-  }
-
-  const last = state.currentCandles[state.currentCandles.length - 1];
-
-  if (candle.timestamp === last.timestamp) {
-    state.currentCandles[state.currentCandles.length - 1] = candle;
-    state.chartInstance.updateData(candle);
-  } else if (candle.timestamp > last.timestamp) {
-    state.currentCandles.push(candle);
-    state.chartInstance.applyMoreData([candle]);
-  }
+  state.liquidationWs.onclose = () => {
+    console.log('Liquidation WebSocket closed, reconnecting...');
+    setTimeout(connectLiquidationWebSocket, 5000);
+  };
+  state.liquidationWs.onerror = (e) => console.error('Liquidation WS error:', e);
 }
 
+function processLiquidation(order) {
+  const symbol = order.s;
+  const price = parseFloat(order.p);
+  const quantity = parseFloat(order.q);
+  const volumeUSD = price * quantity;
+
+  let minVol = MIN_VOLUME_USD;
+  if (symbol === 'BTCUSDT') minVol = MIN_VOLUME_BTC;
+  else if (symbol === 'ETHUSDT') minVol = MIN_VOLUME_ETH;
+  if (volumeUSD < minVol) return;
+
+  const side = order.S;
+  console.log(`Ликвидация: ${symbol} ${side} ${volumeUSD.toFixed(0)} USD (цена ${price})`);
+
+  state.recentLiquidations.unshift({ symbol, side, volume: volumeUSD, price, time: order.T });
+  if (state.recentLiquidations.length > MAX_RECENT) state.recentLiquidations.pop();
+  updateLiquidationFeed(state, selectCoin);
+
+  state.liquidationCount++;
+  updateStatusWithCount(state);
+}
+
+// ---------- СОРТИРОВКА И 30м ----------
 async function refresh30mChanges() {
   const headerSpan = document.querySelector('#listHeader span[data-sort="change30m"]');
   const originalText = headerSpan.textContent;
@@ -505,6 +542,7 @@ async function refresh30mChanges() {
   headerSpan.textContent = originalText;
 }
 
+// ---------- СОБЫТИЯ ----------
 function setupEvents() {
   document.querySelectorAll('.tf-btn').forEach((btn) => {
     btn.addEventListener('click', () => setTimeframe(btn.dataset.tf));
@@ -533,6 +571,7 @@ function sortBy(field) {
 }
 
 function selectCoin(symbol) {
+  if (state.currentSymbol === symbol) return;
   state.currentSymbol = symbol;
   document.getElementById('currentSymbol').textContent = `${symbol} (${state.currentTimeframe})`;
 
@@ -540,18 +579,18 @@ function selectCoin(symbol) {
     el.classList.toggle('active', el.dataset.symbol === symbol);
   });
 
-  loadChartData(symbol);
-  updateHeader(state);
+  loadChart(symbol, state.currentTimeframe);
 }
 
 function setTimeframe(tf) {
+  if (state.currentTimeframe === tf) return;
   state.currentTimeframe = tf;
   document.querySelectorAll('.tf-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.tf === tf);
   });
 
   document.getElementById('currentSymbol').textContent = `${state.currentSymbol} (${tf})`;
-  loadChartData(state.currentSymbol);
+  loadChart(state.currentSymbol, tf);
 }
 
 init();
