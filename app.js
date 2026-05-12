@@ -1,3 +1,6 @@
+// Явная ссылка на глобальный объект KLineChart
+const klinecharts = window.klinecharts;
+
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
 const BINANCE_API = 'https://fapi.binance.com';
 
@@ -8,15 +11,17 @@ const MIN_VOLUME_USD = 10000;
 const STORAGE_PREFIX = 'binance_liq_';
 const MAX_RECENT = 20;
 
-// KLineChart timeframe mapping
+// Преобразование таймфрейма в формат KLineChart { multiplier, timespan }
 function mapTimeframeToPeriod(tf) {
   const unit = tf.slice(-1);
   const value = parseInt(tf, 10);
-  switch (unit) {
-    case 'm': return { span: value, type: 'minute' };
-    case 'h': return { span: value, type: 'hour' };
-    default: return { span: 15, type: 'minute' };
-  }
+  let timespan = 'minute';
+  if (unit === 'h') timespan = 'hour';
+  else if (unit === 'd') timespan = 'day';
+  else if (unit === 'w') timespan = 'week';
+  else if (unit === 'M') timespan = 'month';
+
+  return { multiplier: value, timespan };
 }
 
 function getTimeframeMs(tf) {
@@ -239,7 +244,7 @@ async function loadCoins() {
 function initChart() {
   const container = document.getElementById('chart');
 
-  // Register custom overlay for liquidation markers
+  // Регистрируем оверлей для маркеров ликвидаций
   klinecharts.registerOverlay({
     name: 'liquidation_marker',
     totalStep: 1,
@@ -257,12 +262,8 @@ function initChart() {
         const color = isLong ? '#f6465d' : '#0ecb81';
         figures.push({
           type: 'circle',
-          attrs: {
-            x: overlay.points[0].x,
-            y: y,
-            r: 4
-          },
-          styles: { color: color, fillColor: color }
+          attrs: { x: overlay.points[0].x, y, r: 4 },
+          styles: { color, fillColor: color }
         });
 
         if (volumeText) {
@@ -274,7 +275,7 @@ function initChart() {
               text: volumeText,
               align: 'center'
             },
-            styles: { color: color, fontSize: 10 }
+            styles: { color, fontSize: 10 }
           });
         }
       }
@@ -283,59 +284,28 @@ function initChart() {
     }
   });
 
-  try {
-    state.chartInstance = klinecharts.init(container, {
-      symbol: { ticker: 'BTCUSDT' },
-      period: mapTimeframeToPeriod(state.currentTimeframe),
-      styles: {
-        grid: {
-          horizontal: { color: '#1e2329' },
-          vertical: { color: '#1e2329' }
-        },
-        candle: {
-          upColor: '#0ecb81',
-          downColor: '#f6465d',
-          borderUpColor: '#0ecb81',
-          borderDownColor: '#f6465d',
-          wickUpColor: '#0ecb81',
-          wickDownColor: '#f6465d'
-        }
+  state.chartInstance = klinecharts.init(container, {
+    symbol: { ticker: 'BTCUSDT' },
+    period: mapTimeframeToPeriod(state.currentTimeframe),
+    styles: {
+      grid: {
+        horizontal: { color: '#1e2329' },
+        vertical: { color: '#1e2329' }
       },
-      dataLoader: {
-        getBars: ({ callback }) => {
-          if (state.currentCandles && state.currentCandles.length > 0) {
-            callback(state.currentCandles.map(c => ({
-              timestamp: c.time * 1000,
-              open: c.open,
-              high: c.high,
-              low: c.low,
-              close: c.close,
-              volume: c.volume || 0
-            })));
-          } else {
-            callback([]);
-          }
-        }
+      candle: {
+        upColor: '#0ecb81',
+        downColor: '#f6465d',
+        borderUpColor: '#0ecb81',
+        borderDownColor: '#f6465d',
+        wickUpColor: '#0ecb81',
+        wickDownColor: '#f6465d'
       }
-    });
+    }
+  });
 
-    // Add EMA indicators
-    state.chartInstance.createIndicator('EMA', false, { id: 'ema65', styles: { line: { color: '#a0a4ab' } } }, 65);
-    state.chartInstance.createIndicator('EMA', false, { id: 'ema125', styles: { line: { color: '#a0a4ab' } } }, 125);
-    state.chartInstance.createIndicator('EMA', false, { id: 'ema450', styles: { line: { color: '#e0e3e8' } } }, 450);
-
-    // Subscribe to chart actions (for real-time updates and clicks)
-    state.chartInstance.subscribeAction('onZoom', () => {
-      // Handle zoom
-    });
-
-    state.chartInstance.subscribeAction('onCrosshairChange', (data) => {
-      // Handle crosshair
-    });
-
-  } catch (e) {
-    console.error('Ошибка инициализации графика:', e);
-  }
+  state.chartInstance.createIndicator('EMA', false, { id: 'ema65', styles: { line: { color: '#a0a4ab' } } }, 65);
+  state.chartInstance.createIndicator('EMA', false, { id: 'ema125', styles: { line: { color: '#a0a4ab' } } }, 125);
+  state.chartInstance.createIndicator('EMA', false, { id: 'ema450', styles: { line: { color: '#e0e3e8' } } }, 450);
 
   window.addEventListener('resize', () => {
     if (state.chartInstance && container) {
@@ -403,7 +373,6 @@ function processLiquidation(order) {
 
   const isLongLiquidation = order.S === 'SELL';
 
-  // Store marker data
   const markerData = {
     time: order.T,
     price: price,
@@ -436,7 +405,7 @@ function processLiquidation(order) {
 function updateMarkersOnChart() {
   if (!state.chartInstance) return;
 
-  // Remove existing liquidation overlays
+  // Удаляем старые оверлеи ликвидаций
   const existingOverlays = state.chartInstance.getOverlays?.() || [];
   existingOverlays.forEach(overlay => {
     if (overlay.name === 'liquidation_marker') {
@@ -444,17 +413,15 @@ function updateMarkersOnChart() {
     }
   });
 
-  // Add new liquidation markers
+  // Добавляем новые
   state.liquidationMarkers.forEach(marker => {
     if (!state.chartInstance) return;
 
-    const point = {
+    state.chartInstance.addOverlay('liquidation_marker', {
       timestamp: marker.time,
       value: marker.price
-    };
-
-    state.chartInstance.addOverlay('liquidation_marker', point, {
-      data: {
+    }, {
+      extendData: {
         price: marker.price,
         volumeText: marker.volumeText,
         isLong: marker.isLong
@@ -468,8 +435,8 @@ async function loadChartData(symbol) {
     const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${state.currentTimeframe}&limit=1400`);
     const klines = await res.json();
 
-    state.currentCandles = klines.map((k) => ({
-      time: Math.floor(k[0] / 1000),
+    const candles = klines.map((k) => ({
+      timestamp: k[0],          // миллисекунды
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
@@ -477,20 +444,13 @@ async function loadChartData(symbol) {
       volume: parseFloat(k[5])
     }));
 
+    state.currentCandles = candles;
     state.oldestTime = klines.length > 0 ? klines[0][0] : null;
 
-    // Update chart with new data
+    // Применяем данные и пересчитываем размер графика
     if (state.chartInstance) {
-      state.chartInstance.applyNewData(
-        state.currentCandles.map(c => ({
-          timestamp: c.time * 1000,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-          volume: c.volume
-        }))
-      );
+      state.chartInstance.applyNewData(candles);
+      state.chartInstance.resize();
     }
 
     if (!state.allLiquidations.has(symbol)) state.allLiquidations.set(symbol, loadSavedMarkers(symbol));
@@ -521,7 +481,7 @@ async function loadMoreHistory() {
     if (klines.length === 0) return;
 
     const newCandles = klines.map((k) => ({
-      time: Math.floor(k[0] / 1000),
+      timestamp: k[0],
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
@@ -533,16 +493,7 @@ async function loadMoreHistory() {
     state.currentCandles = [...newCandles, ...state.currentCandles];
 
     if (state.chartInstance) {
-      state.chartInstance.applyNewData(
-        state.currentCandles.map(c => ({
-          timestamp: c.time * 1000,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-          volume: c.volume
-        }))
-      );
+      state.chartInstance.applyNewData(state.currentCandles);
     }
 
     updateMarkersOnChart();
