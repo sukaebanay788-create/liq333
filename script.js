@@ -1,429 +1,723 @@
-(function() {
-    if (typeof klinecharts === 'undefined') {
-        document.getElementById('chart').innerHTML = '<div style="color:red; padding:20px;">KLineChart не загружена</div>';
-        return;
+const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
+const BINANCE_API = 'https://fapi.binance.com';
+
+const MAX_MARKERS_PER_SYMBOL = 500;
+const MIN_VOLUME_BTC = 100000;
+const MIN_VOLUME_ETH = 50000;
+const MIN_VOLUME_USD = 10000;
+const STORAGE_PREFIX = 'binance_liq_';
+const MAX_RECENT = 20;
+
+// KLineChart timeframe mapping
+function mapTimeframeToPeriod(tf) {
+  const unit = tf.slice(-1);
+  const value = parseInt(tf, 10);
+  switch (unit) {
+    case 'm': return { span: value, type: 'minute' };
+    case 'h': return { span: value, type: 'hour' };
+    default: return { span: 15, type: 'minute' };
+  }
+}
+
+function getTimeframeMs(tf) {
+  const unit = tf.slice(-1);
+  const value = parseInt(tf, 10);
+  switch (unit) {
+    case 'm': return value * 60 * 1000;
+    case 'h': return value * 60 * 60 * 1000;
+    default: return 15 * 60 * 1000;
+  }
+}
+
+const state = {
+  coins: new Map(),
+  filteredCoins: [],
+  currentSymbol: 'BTCUSDT',
+  ws: null,
+  wsReady: false,
+  liquidationWs: null,
+  chartInstance: null,
+  sortField: 'change',
+  sortDesc: true,
+  currentTimeframe: '15m',
+  lastSubscriptionSet: new Set(),
+  currentKlineSymbol: null,
+  oldestTime: null,
+  isLoadingMore: false,
+  liquidationMarkers: [],
+  liquidationCount: 0,
+  allLiquidations: new Map(),
+  recentLiquidations: [],
+};
+
+function formatPrice(price) {
+  if (price >= 1000) return price.toFixed(2);
+  if (price >= 1) return price.toFixed(4);
+  return price.toFixed(6);
+}
+
+function updateHeader(stateObj) {
+  const coin = stateObj.coins.get(stateObj.currentSymbol);
+  if (!coin) return;
+
+  document.getElementById('currentSymbol').textContent = `${stateObj.currentSymbol} (${stateObj.currentTimeframe})`;
+  document.getElementById('currentPrice').textContent = formatPrice(coin.price);
+
+  const ch = document.getElementById('currentChange');
+  const change = coin.change;
+  ch.textContent = `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
+  ch.className = `symbol-change ${change >= 0 ? 'positive' : 'negative'}`;
+}
+
+function sortCoins(stateObj) {
+  stateObj.filteredCoins.sort((a, b) => {
+    let va = a[stateObj.sortField];
+    let vb = b[stateObj.sortField];
+
+    if (typeof va === 'string') {
+      va = va.toLowerCase();
+      vb = vb.toLowerCase();
     }
 
-    // Динамический список фьючерсных USDT-пар будет загружен
-    let SYMBOLS = [];
-    let symbolSet = new Set();
+    if (va < vb) return stateObj.sortDesc ? 1 : -1;
+    if (va > vb) return stateObj.sortDesc ? -1 : 1;
+    return 0;
+  });
+}
 
-    let selectedSymbol = 'BTCUSDT';
-    let currentInterval = '1m';
-    let currentChartData = [];
+function createCoinRow(coin, stateObj, onSelectCoin) {
+  const div = document.createElement('div');
+  div.className = `coin-item${coin.symbol === stateObj.currentSymbol ? ' active' : ''}`;
+  div.dataset.symbol = coin.symbol;
+  div.onclick = () => onSelectCoin(coin.symbol);
 
-    let chart = null;
-    let wsChart = null;
-    let wsScreener = null;
-    let currentFetchController = null;
+  const c24 = coin.change >= 0 ? 'positive' : 'negative';
+  const c30 = coin.change30m >= 0 ? 'positive' : 'negative';
 
-    // Маркеры ликвидаций
-    const LIQ_MARKERS = new Map();
-    const LIQ_VISIBILITY_DURATION = 30000;
-    const MIN_LIQ_COST_USDT = 5000; // снижен порог
-    let liquidationWs = null;
+  div.innerHTML = `
+    <span class="coin-symbol">${coin.symbol.replace('USDT', '')}</span>
+    <span class="coin-price">${formatPrice(coin.price)}</span>
+    <span class="coin-change ${c24}">${coin.change >= 0 ? '+' : ''}${coin.change.toFixed(2)}%</span>
+    <span class="coin-change ${c30}">${coin.change30m >= 0 ? '+' : ''}${coin.change30m.toFixed(2)}%</span>
+  `;
 
-    // Лог
-    const logPanel = document.getElementById('log-panel');
-    function log(msg, type = 'info') {
-        const time = new Date().toLocaleTimeString();
-        const div = document.createElement('div');
-        div.textContent = `[${time}] ${msg}`;
-        div.className = 'log-' + type;
-        logPanel.appendChild(div);
-        logPanel.scrollTop = logPanel.scrollHeight;
-    }
+  return div;
+}
 
-    // Гибкое форматирование цены
-    function getPricePrecision(price) {
-        if (price < 0.00001) return 8;
-        if (price < 0.0001) return 7;
-        if (price < 0.001) return 6;
-        if (price < 0.01) return 5;
-        if (price < 0.1) return 4;
-        return 2;
-    }
+function renderCoinsList(stateObj, onSelectCoin) {
+  const container = document.getElementById('coinsList');
+  container.innerHTML = '';
+  stateObj.filteredCoins.forEach((coin) => container.appendChild(createCoinRow(coin, stateObj, onSelectCoin)));
+}
 
-    function formatPrice(price, symbol) {
-        // symbol не используется, точность только от цены
-        const precision = getPricePrecision(price);
-        return price.toFixed(precision);
-    }
+function updateCoinRow(coin) {
+  const row = document.querySelector(`.coin-item[data-symbol="${coin.symbol}"]`);
+  if (!row) return;
 
-    function updateChartPricePrecision(price) {
-        if (!chart) return;
-        const precision = getPricePrecision(price);
-        if (typeof chart.setPriceVolumePrecision === 'function') {
-            chart.setPriceVolumePrecision(precision, 2);
-        }
-    }
+  row.children[1].textContent = formatPrice(coin.price);
+  row.children[2].textContent = `${coin.change >= 0 ? '+' : ''}${coin.change.toFixed(2)}%`;
+  row.children[2].className = `coin-change ${coin.change >= 0 ? 'positive' : 'negative'}`;
+}
 
-    // Скринер
-    function buildScreenerRows() {
-        const tbody = document.querySelector('#screener-table tbody');
-        tbody.innerHTML = '';
-        SYMBOLS.forEach(sym => {
-            const tr = document.createElement('tr');
-            tr.id = 'row-' + sym;
-            tr.innerHTML = `<td class="pair">${sym.replace('USDT', '')}</td><td class="price">-</td><td class="change neutral">-</td>`;
-            tr.addEventListener('click', () => selectSymbol(sym));
-            tbody.appendChild(tr);
+function updateCoinsCount(stateObj) {
+  document.getElementById('coinsCount').textContent = stateObj.filteredCoins.length;
+}
+
+function updateConnectionStatus(stateObj, ok) {
+  const el = document.getElementById('connStatus');
+  el.textContent = ok ? `Connected (${stateObj.liquidationCount} liq)` : 'Disconnected';
+  el.className = `connection-status ${ok ? 'status-connected' : 'status-disconnected'}`;
+}
+
+function updateStatusWithCount(stateObj) {
+  const el = document.getElementById('connStatus');
+  if (el) el.textContent = `Connected (${stateObj.liquidationCount} liq)`;
+}
+
+function updateLiquidationFeed(stateObj, onSelectCoin) {
+  const feedEl = document.getElementById('liquidationFeed');
+  if (!feedEl) return;
+
+  if (stateObj.recentLiquidations.length === 0) {
+    feedEl.innerHTML = '<div style="color:#848e9c;text-align:center;">Ожидание ликвидаций...</div>';
+    return;
+  }
+
+  feedEl.innerHTML = stateObj.recentLiquidations.map((liq, idx) => {
+    const sideClass = liq.side === 'SELL' ? 'liq-side-sell' : 'liq-side-buy';
+    const sideText = liq.side === 'SELL' ? 'LONG LIQ' : 'SHORT LIQ';
+    return `
+      <div class="liquidation-feed-item" data-liq-index="${idx}" title="Открыть график ${liq.symbol.replace('USDT', '')}">
+        <span class="liq-symbol">${liq.symbol.replace('USDT', '')}</span>
+        <span class="${sideClass}">${sideText}</span>
+        <span class="liq-volume">${(liq.volume / 1000).toFixed(0)}K</span>
+        <span>${liq.price.toFixed(2)}</span>
+      </div>
+    `;
+  }).join('');
+
+  feedEl.querySelectorAll('.liquidation-feed-item').forEach((el) => {
+    el.addEventListener('click', () => {
+      const item = stateObj.recentLiquidations[Number(el.dataset.liqIndex)];
+      if (item) onSelectCoin(item.symbol);
+    });
+  });
+}
+
+async function init() {
+  await loadCoins();
+  initChart();
+  connectWebSocket();
+  connectLiquidationWebSocket();
+  setupEvents();
+  loadChartData(state.currentSymbol);
+}
+
+async function loadCoins() {
+  try {
+    const exchangeInfoRes = await fetch(`${BINANCE_API}/fapi/v1/exchangeInfo`);
+    const exchangeData = await exchangeInfoRes.json();
+
+    const usdtPairs = exchangeData.symbols.filter((s) =>
+      s.quoteAsset === 'USDT' && s.status === 'TRADING' && s.contractType === 'PERPETUAL'
+    );
+
+    const tickersRes = await fetch(`${BINANCE_API}/fapi/v1/ticker/24hr`);
+    const tickers = await tickersRes.json();
+    const tickersMap = new Map(tickers.map((t) => [t.symbol, t]));
+
+    const promises = usdtPairs.map(async (pair) => {
+      const symbol = pair.symbol;
+      const ticker = tickersMap.get(symbol);
+      if (!ticker) return null;
+
+      try {
+        const klines30m = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=30m&limit=2`).then((r) => {
+          if (!r.ok) throw new Error('No data');
+          return r.json();
         });
-    }
 
-    function updateScreenerRow(symbol, price, changePercent) {
-        if (!symbolSet.has(symbol)) return;
-        const row = document.getElementById('row-' + symbol);
-        if (!row) return;
-        const priceCell = row.querySelector('.price');
-        const changeCell = row.querySelector('.change');
-        if (priceCell) priceCell.textContent = formatPrice(price, symbol);
-        if (changeCell) {
-            const pct = parseFloat(changePercent);
-            changeCell.textContent = (pct > 0 ? '+' : '') + changePercent + '%';
-            changeCell.className = 'change ' + (pct > 0 ? 'positive' : pct < 0 ? 'negative' : 'neutral');
+        let change30m = 0;
+        if (klines30m.length >= 1) {
+          const lastCandle = klines30m[klines30m.length - 1];
+          const open = parseFloat(lastCandle[1]);
+          const close = parseFloat(lastCandle[4]);
+          change30m = ((close - open) / open) * 100;
         }
-        if (selectedSymbol === symbol && chart) {
-            updateChartPricePrecision(price);
-        }
-    }
 
-    async function fetchAllSymbols() {
-        try {
-            const resp = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
-            const data = await resp.json();
-            SYMBOLS = data.symbols
-                .filter(s => s.quoteAsset === 'USDT' && s.contractType === 'PERPETUAL' && s.status === 'TRADING')
-                .map(s => s.symbol);
-            symbolSet = new Set(SYMBOLS);
-            log(`Загружено ${SYMBOLS.length} фьючерсных USDT-пар`);
-        } catch (err) {
-            log('Ошибка загрузки списка символов: ' + err.message, 'error');
-            // fallback – минимальный список, чтобы приложение не падало
-            SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT'];
-            symbolSet = new Set(SYMBOLS);
-        }
-    }
-
-    async function initScreenerData() {
-        if (SYMBOLS.length === 0) return;
-        try {
-            const resp = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
-            const all = await resp.json();
-            for (const item of all) {
-                if (!symbolSet.has(item.symbol)) continue;
-                const price = parseFloat(item.lastPrice);
-                const changePercent = parseFloat(item.priceChangePercent).toFixed(2);
-                updateScreenerRow(item.symbol, price, changePercent);
-            }
-        } catch (err) {
-            log('Ошибка 24hr тикера: ' + err.message, 'error');
-        }
-    }
-
-    function startScreenerWebSocket() {
-        if (wsScreener) {
-            wsScreener.onclose = null;
-            wsScreener.close();
-        }
-        // Поток мини-тикеров для всех фьючерсных символов
-        wsScreener = new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr');
-        wsScreener.onmessage = (e) => {
-            try {
-                const msg = JSON.parse(e.data);
-                if (Array.isArray(msg)) {
-                    for (const item of msg) {
-                        if (!symbolSet.has(item.s)) continue;
-                        const price = parseFloat(item.c);
-                        const openPrice = parseFloat(item.o);
-                        const changePercent = openPrice ? ((price - openPrice) / openPrice * 100).toFixed(2) : '0.00';
-                        updateScreenerRow(item.s, price, changePercent);
-                    }
-                }
-            } catch (err) {}
+        return {
+          symbol,
+          price: parseFloat(ticker.lastPrice),
+          change: parseFloat(ticker.priceChangePercent),
+          change30m,
         };
-        wsScreener.onclose = () => setTimeout(startScreenerWebSocket, 5000);
-    }
-
-    // Смена символа
-    function selectSymbol(sym) {
-        if (selectedSymbol === sym) return;
-        log(`Смена символа: ${selectedSymbol} → ${sym}`);
-
-        if (chart) {
-            LIQ_MARKERS.forEach((ids) => {
-                try { chart.removeOverlay(ids.lineId); } catch (e) {}
-                try { chart.removeOverlay(ids.annotId); } catch (e) {}
-            });
-            LIQ_MARKERS.clear();
-        }
-
-        selectedSymbol = sym;
-        document.querySelectorAll('#screener-table tbody tr').forEach(tr => tr.classList.remove('active'));
-        const activeRow = document.getElementById('row-' + sym);
-        if (activeRow) activeRow.classList.add('active');
-        loadChart(sym, currentInterval);
-    }
-
-    // График
-    function initChart() {
-        if (chart) {
-            if (typeof chart.destroy === 'function') chart.destroy();
-            chart = null;
-        }
-        chart = klinecharts.init(document.getElementById('chart'), {
-            styles: {
-                grid: {
-                    horizontal: { color: '#2b2f36', style: 'dash' },
-                    vertical: { color: '#2b2f36', style: 'dash' }
-                },
-                candle: {
-                    bar: { upColor: '#0ecb81', downColor: '#f6465d', noChangeColor: '#848e9c' }
-                },
-                xAxis: { axisLine: { color: '#2b2f36' }, tickText: { color: '#848e9c', size: 11 } },
-                yAxis: { axisLine: { color: '#2b2f36' }, tickText: { color: '#848e9c', size: 11 } }
-            },
-            worker: false
-        });
-        log('График инициализирован');
-    }
-
-    window.addEventListener('resize', () => {
-        if (chart && typeof chart.resize === 'function') chart.resize();
+      } catch (_error) {
+        return {
+          symbol,
+          price: parseFloat(ticker.lastPrice),
+          change: parseFloat(ticker.priceChangePercent),
+          change30m: 0,
+        };
+      }
     });
 
-    async function fetchHistory(symbol, interval, limit, signal) {
-        const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-        const response = await fetch(url, { signal });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const raw = await response.json();
-        if (!Array.isArray(raw)) throw new Error(raw.msg || 'Неожиданный формат ответа');
-        return raw.map(d => ({
-            timestamp: d[0],
-            open: parseFloat(d[1]),
-            high: parseFloat(d[2]),
-            low: parseFloat(d[3]),
-            close: parseFloat(d[4]),
-            volume: parseFloat(d[5])
-        }));
-    }
+    const results = await Promise.all(promises);
+    results.forEach((coinData) => {
+      if (coinData) state.coins.set(coinData.symbol, coinData);
+    });
 
-    async function loadChart(symbol, interval) {
-        log(`Загрузка графика ${symbol} ${interval}`);
-        if (wsChart) {
-            wsChart.onclose = null;
-            wsChart.close();
-            wsChart = null;
-        }
-        if (currentFetchController) currentFetchController.abort();
-        currentFetchController = new AbortController();
-        const { signal } = currentFetchController;
-        try {
-            const history = await fetchHistory(symbol, interval, 500, signal);
-            if (signal.aborted) return;
-            currentChartData = history;
-            if (!chart) initChart();
-            chart.applyNewData(history);
-            if (history.length) {
-                updateChartPricePrecision(history[history.length - 1].close);
-            }
-            const wsUrl = `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@kline_${interval}`;
-            connectChartWebSocket(wsUrl, symbol, interval);
-        } catch (err) {
-            if (err.name === 'AbortError') return;
-            log(`Ошибка загрузки истории: ${err.message}`, 'error');
-            setTimeout(() => {
-                if (selectedSymbol === symbol && currentInterval === interval) loadChart(symbol, interval);
-            }, 3000);
-        }
-    }
+    state.filteredCoins = Array.from(state.coins.values());
+    sortCoins(state);
+    renderCoinsList(state, selectCoin);
+    updateCoinsCount(state);
+  } catch (error) {
+    console.error('Ошибка загрузки монет:', error);
+    document.getElementById('coinsList').innerHTML = '<div class="loading">Ошибка загрузки</div>';
+  }
+}
 
-    function connectChartWebSocket(wsUrl, symbol, interval) {
-        if (wsChart) wsChart.close();
-        wsChart = new WebSocket(wsUrl);
-        wsChart.onopen = () => log('WebSocket графика открыт');
-        wsChart.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                if (msg.e === 'kline') {
-                    const k = msg.k;
-                    const candle = {
-                        timestamp: k.t,
-                        open: parseFloat(k.o),
-                        high: parseFloat(k.h),
-                        low: parseFloat(k.l),
-                        close: parseFloat(k.c),
-                        volume: parseFloat(k.v)
-                    };
-                    const last = currentChartData[currentChartData.length - 1];
-                    if (candle.timestamp === last?.timestamp) {
-                        currentChartData[currentChartData.length - 1] = candle;
-                        chart.updateData(candle);
-                    } else if (!last || candle.timestamp > last.timestamp) {
-                        currentChartData.push(candle);
-                        chart.applyMoreData([candle]);
-                    }
-                    if (selectedSymbol === symbol) {
-                        updateChartPricePrecision(candle.close);
-                    }
-                }
-            } catch (e) {
-                console.warn(e);
-            }
-        };
-        wsChart.onclose = () => {
-            log('WebSocket графика закрыт, переподключение через 3с', 'warn');
-            setTimeout(() => {
-                if (selectedSymbol === symbol && currentInterval === interval) {
-                    connectChartWebSocket(wsUrl, symbol, interval);
-                }
-            }, 3000);
-        };
-    }
+function initChart() {
+  const container = document.getElementById('chart');
 
-    // Ликвидации – все, без фильтрации по символам
-    function startLiquidationStream() {
-        if (liquidationWs) {
-            liquidationWs.onclose = null;
-            liquidationWs.close(1000, 'Переподключение');
-            liquidationWs = null;
-        }
+  // Register custom overlay for liquidation markers
+  klinecharts.registerOverlay({
+    name: 'liquidation_marker',
+    totalStep: 1,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ overlay }) => {
+      const { price, volumeText, isLong } = overlay.extendData || {};
+      if (!price) return [];
 
-        // Поток всех форс-ордеров
-        const wsUrl = 'wss://fstream.binance.com/ws/!forceOrder@arr';
-        liquidationWs = new WebSocket(wsUrl);
+      const figures = [];
+      const y = overlay.points[0]?.y;
 
-        liquidationWs.onmessage = (event) => {
-            try {
-                const msg = JSON.parse(event.data);
-                if (msg.e === 'forceOrder') {
-                    const order = msg.o;
-                    const symbol = order.s;
-                    const price = parseFloat(order.ap);
-                    const side = order.S;
-                    const quantity = parseFloat(order.q);
-                    const tradeTime = order.T;
-                    const costUSDT = quantity * price;
-
-                    const sideText = side === 'SELL' ? 'LONG Liq' : 'SHORT Liq';
-                    const logType = side === 'SELL' ? 'sell' : 'buy';
-
-                    log(
-                        `Ликвидация: ${sideText} ${symbol} по ${formatPrice(price, symbol)} ` +
-                        `(Qty: ${quantity}, $${costUSDT.toFixed(2)})`,
-                        logType
-                    );
-
-                    // На график – только текущий символ и >= порога
-                    if (symbol === selectedSymbol && costUSDT >= MIN_LIQ_COST_USDT) {
-                        drawLiquidationMarker(price, side, quantity, tradeTime, costUSDT);
-                    }
-                }
-            } catch (err) {
-                console.warn('Ошибка парсинга ликвидации:', err);
-            }
-        };
-
-        liquidationWs.onclose = (event) => {
-            log(`WebSocket ликвидаций закрыт (${event.code}). Переподключение через 5с.`, 'warn');
-            setTimeout(() => startLiquidationStream(), 5000);
-        };
-
-        liquidationWs.onerror = (error) => {
-            log('Ошибка WebSocket ликвидаций', 'error');
-        };
-
-        log('Запущен поток всех ликвидаций.');
-    }
-
-    function drawLiquidationMarker(price, side, quantity, tradeTime, costUSDT) {
-        if (!chart) return;
-
-        const key = `${tradeTime}_${side}_${costUSDT}_${Math.random()}`;
-        const lineId = `liq-line-${key}`;
-        const annotId = `liq-annot-${key}`;
-        const shortLabel = side === 'SELL' ? 'L' : 'S';
-        const color = side === 'SELL' ? '#ff4d4f' : '#0ecb81';
-
-        LIQ_MARKERS.set(key, { lineId, annotId });
-
-        chart.createOverlay({
-            name: 'priceLine',
-            id: lineId,
-            points: [{ timestamp: tradeTime, value: price }],
-            extendData: `${shortLabel} $${costUSDT.toFixed(0)}`,
-            styles: {
-                line: {
-                    color: color,
-                    size: 2,
-                    dashed: true
-                }
-            }
+      if (y !== undefined) {
+        const color = isLong ? '#f6465d' : '#0ecb81';
+        figures.push({
+          type: 'circle',
+          attrs: {
+            x: overlay.points[0].x,
+            y: y,
+            r: 4
+          },
+          styles: { color: color, fillColor: color }
         });
 
-        chart.createOverlay({
-            name: 'simpleAnnotation',
-            id: annotId,
-            points: [{ timestamp: tradeTime, value: price }],
-            extendData: `${shortLabel} ${formatPrice(price, selectedSymbol)}`,
-            styles: {
-                text: {
-                    color: '#ffffff',
-                    size: 11,
-                    backgroundColor: color
-                },
-                offset: [0, -15]
-            }
-        });
-
-        setTimeout(() => {
-            try {
-                chart.removeOverlay(lineId);
-                chart.removeOverlay(annotId);
-            } catch (e) {}
-            LIQ_MARKERS.delete(key);
-        }, LIQ_VISIBILITY_DURATION);
-    }
-
-    // Интервалы
-    function bindIntervalButtons() {
-        document.querySelectorAll('.interval-btn').forEach(btn => {
-            btn.addEventListener('click', function() {
-                const interval = this.dataset.interval;
-                if (currentInterval === interval) return;
-                log(`Смена интервала: ${currentInterval} → ${interval}`);
-                currentInterval = interval;
-                document.querySelectorAll('.interval-btn').forEach(b => b.classList.remove('active'));
-                this.classList.add('active');
-                loadChart(selectedSymbol, interval);
-            });
-        });
-    }
-
-    // Старт приложения
-    async function startApp() {
-        log('Приложение запущено');
-        // 1. Загрузка списка всех фьючерсных USDT-пар
-        await fetchAllSymbols();
-        // 2. Построение скринера
-        buildScreenerRows();
-        // 3. График
-        initChart();
-        bindIntervalButtons();
-        // 4. Начальные данные скринера
-        initScreenerData();
-        // 5. Вебсокет скринера (все мини-тикеры)
-        startScreenerWebSocket();
-        // 6. Поток всех ликвидаций
-        startLiquidationStream();
-
-        // Выбор символа по умолчанию – BTCUSDT, если есть
-        if (!symbolSet.has('BTCUSDT') && SYMBOLS.length > 0) {
-            selectedSymbol = SYMBOLS[0];
+        if (volumeText) {
+          figures.push({
+            type: 'text',
+            attrs: {
+              x: overlay.points[0].x,
+              y: isLong ? y - 12 : y + 12,
+              text: volumeText,
+              align: 'center'
+            },
+            styles: { color: color, fontSize: 10 }
+          });
         }
-        document.getElementById('row-' + selectedSymbol)?.classList.add('active');
-        loadChart(selectedSymbol, '1m');
+      }
+
+      return figures;
+    }
+  });
+
+  try {
+    state.chartInstance = klinecharts.init(container, {
+      symbol: { ticker: 'BTCUSDT' },
+      period: mapTimeframeToPeriod(state.currentTimeframe),
+      styles: {
+        grid: {
+          horizontal: { color: '#1e2329' },
+          vertical: { color: '#1e2329' }
+        },
+        candle: {
+          upColor: '#0ecb81',
+          downColor: '#f6465d',
+          borderUpColor: '#0ecb81',
+          borderDownColor: '#f6465d',
+          wickUpColor: '#0ecb81',
+          wickDownColor: '#f6465d'
+        }
+      },
+      dataLoader: {
+        getBars: ({ callback }) => {
+          if (state.currentCandles && state.currentCandles.length > 0) {
+            callback(state.currentCandles.map(c => ({
+              timestamp: c.time * 1000,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+              volume: c.volume || 0
+            })));
+          } else {
+            callback([]);
+          }
+        }
+      }
+    });
+
+    // Add EMA indicators
+    state.chartInstance.createIndicator('EMA', false, { id: 'ema65', styles: { line: { color: '#a0a4ab' } } }, 65);
+    state.chartInstance.createIndicator('EMA', false, { id: 'ema125', styles: { line: { color: '#a0a4ab' } } }, 125);
+    state.chartInstance.createIndicator('EMA', false, { id: 'ema450', styles: { line: { color: '#e0e3e8' } } }, 450);
+
+    // Subscribe to chart actions (for real-time updates and clicks)
+    state.chartInstance.subscribeAction('onZoom', () => {
+      // Handle zoom
+    });
+
+    state.chartInstance.subscribeAction('onCrosshairChange', (data) => {
+      // Handle crosshair
+    });
+
+  } catch (e) {
+    console.error('Ошибка инициализации графика:', e);
+  }
+
+  window.addEventListener('resize', () => {
+    if (state.chartInstance && container) {
+      state.chartInstance.resize();
+    }
+  });
+}
+
+function connectLiquidationWebSocket() {
+  state.liquidationWs = new WebSocket(`${BINANCE_WS_MARKET}/!forceOrder@arr`);
+
+  state.liquidationWs.onopen = () => console.log('Liquidation WebSocket connected');
+  state.liquidationWs.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.e === 'forceOrder') processLiquidation(msg.o);
+  };
+  state.liquidationWs.onclose = () => {
+    console.log('Liquidation WebSocket closed, reconnecting...');
+    setTimeout(connectLiquidationWebSocket, 5000);
+  };
+  state.liquidationWs.onerror = (e) => console.error('Liquidation WS error:', e);
+}
+
+function loadSavedMarkers(symbol) {
+  const saved = localStorage.getItem(STORAGE_PREFIX + symbol);
+  if (!saved) return [];
+
+  try {
+    return JSON.parse(saved);
+  } catch (e) {
+    console.error('Ошибка парсинга сохранённых маркеров:', e);
+    return [];
+  }
+}
+
+function saveMarkers(symbol, markers) {
+  const key = STORAGE_PREFIX + symbol;
+  try {
+    localStorage.setItem(key, JSON.stringify(markers));
+  } catch (e) {
+    console.error('Ошибка сохранения маркеров в localStorage:', e);
+    if (e.name === 'QuotaExceededError') {
+      const keys = Object.keys(localStorage).filter((k) => k.startsWith(STORAGE_PREFIX));
+      keys.sort((a, b) => (localStorage.getItem(a)?.length || 0) - (localStorage.getItem(b)?.length || 0));
+      for (let i = 0; i < Math.min(5, keys.length); i++) localStorage.removeItem(keys[i]);
+      try {
+        localStorage.setItem(key, JSON.stringify(markers));
+      } catch (_e2) {
+        console.error('Повторная ошибка сохранения');
+      }
+    }
+  }
+}
+
+function processLiquidation(order) {
+  const symbol = order.s;
+  const price = parseFloat(order.p);
+  const quantity = parseFloat(order.q);
+  const volumeUSD = price * quantity;
+
+  let minVol = MIN_VOLUME_USD;
+  if (symbol === 'BTCUSDT') minVol = MIN_VOLUME_BTC;
+  else if (symbol === 'ETHUSDT') minVol = MIN_VOLUME_ETH;
+  if (volumeUSD < minVol) return;
+
+  const isLongLiquidation = order.S === 'SELL';
+
+  // Store marker data
+  const markerData = {
+    time: order.T,
+    price: price,
+    volumeText: `${(volumeUSD / 1000).toFixed(0)}K`,
+    isLong: isLongLiquidation
+  };
+
+  state.recentLiquidations.unshift({ symbol, side: order.S, volume: volumeUSD, price, time: order.T });
+  if (state.recentLiquidations.length > MAX_RECENT) state.recentLiquidations.pop();
+  updateLiquidationFeed(state, selectCoin);
+
+  if (!state.allLiquidations.has(symbol)) state.allLiquidations.set(symbol, loadSavedMarkers(symbol));
+  const symbolMarkers = state.allLiquidations.get(symbol);
+
+  const exists = symbolMarkers.some((m) => m.time === markerData.time && m.volumeText === markerData.volumeText);
+  if (!exists) {
+    symbolMarkers.push(markerData);
+    if (symbolMarkers.length > MAX_MARKERS_PER_SYMBOL) symbolMarkers.shift();
+    saveMarkers(symbol, symbolMarkers);
+  }
+
+  if (symbol === state.currentSymbol) {
+    state.liquidationMarkers = symbolMarkers;
+    updateMarkersOnChart();
+    state.liquidationCount = state.liquidationMarkers.length;
+    updateStatusWithCount(state);
+  }
+}
+
+function updateMarkersOnChart() {
+  if (!state.chartInstance) return;
+
+  // Remove existing liquidation overlays
+  const existingOverlays = state.chartInstance.getOverlays?.() || [];
+  existingOverlays.forEach(overlay => {
+    if (overlay.name === 'liquidation_marker') {
+      state.chartInstance.removeOverlay(overlay.id);
+    }
+  });
+
+  // Add new liquidation markers
+  state.liquidationMarkers.forEach(marker => {
+    if (!state.chartInstance) return;
+
+    const point = {
+      timestamp: marker.time,
+      value: marker.price
+    };
+
+    state.chartInstance.addOverlay('liquidation_marker', point, {
+      data: {
+        price: marker.price,
+        volumeText: marker.volumeText,
+        isLong: marker.isLong
+      }
+    });
+  });
+}
+
+async function loadChartData(symbol) {
+  try {
+    const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${state.currentTimeframe}&limit=1400`);
+    const klines = await res.json();
+
+    state.currentCandles = klines.map((k) => ({
+      time: Math.floor(k[0] / 1000),
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5])
+    }));
+
+    state.oldestTime = klines.length > 0 ? klines[0][0] : null;
+
+    // Update chart with new data
+    if (state.chartInstance) {
+      state.chartInstance.applyNewData(
+        state.currentCandles.map(c => ({
+          timestamp: c.time * 1000,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.volume
+        }))
+      );
     }
 
-    window.addEventListener('DOMContentLoaded', startApp);
-})();
+    if (!state.allLiquidations.has(symbol)) state.allLiquidations.set(symbol, loadSavedMarkers(symbol));
+    state.liquidationMarkers = state.allLiquidations.get(symbol) || [];
+    updateMarkersOnChart();
+    state.liquidationCount = state.liquidationMarkers.length;
+    updateStatusWithCount(state);
+
+    if (state.wsReady) subscribeToKlineStream(symbol);
+    updateHeader(state);
+  } catch (e) {
+    console.error('Ошибка загрузки графика:', e);
+  }
+}
+
+async function loadMoreHistory() {
+  if (state.isLoadingMore || !state.oldestTime) return;
+  state.isLoadingMore = true;
+
+  const btn = document.getElementById('loadMoreBtn');
+  btn.textContent = '⏳';
+  btn.disabled = true;
+
+  try {
+    const endTime = state.oldestTime - 1;
+    const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${state.currentSymbol}&interval=${state.currentTimeframe}&limit=1000&endTime=${endTime}`);
+    const klines = await res.json();
+    if (klines.length === 0) return;
+
+    const newCandles = klines.map((k) => ({
+      time: Math.floor(k[0] / 1000),
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5])
+    }));
+
+    state.oldestTime = klines[0][0];
+    state.currentCandles = [...newCandles, ...state.currentCandles];
+
+    if (state.chartInstance) {
+      state.chartInstance.applyNewData(
+        state.currentCandles.map(c => ({
+          timestamp: c.time * 1000,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: c.volume
+        }))
+      );
+    }
+
+    updateMarkersOnChart();
+  } catch (e) {
+    console.error('Ошибка подгрузки истории:', e);
+  } finally {
+    btn.textContent = '📜';
+    btn.disabled = false;
+    state.isLoadingMore = false;
+  }
+}
+
+function connectWebSocket() {
+  state.ws = new WebSocket(BINANCE_WS_MARKET);
+
+  state.ws.onopen = () => {
+    state.wsReady = true;
+    updateConnectionStatus(state, true);
+    updateSubscriptions();
+    if (state.currentSymbol) subscribeToKlineStream(state.currentSymbol);
+  };
+
+  state.ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.id) return;
+    if (msg.e === '24hrTicker') updateTicker(msg);
+    else if (msg.e === 'kline') updateChartWithKline(msg);
+  };
+
+  state.ws.onclose = () => {
+    state.wsReady = false;
+    updateConnectionStatus(state, false);
+    state.lastSubscriptionSet.clear();
+    state.currentKlineSymbol = null;
+    setTimeout(connectWebSocket, 5000);
+  };
+
+  state.ws.onerror = (e) => console.error('WS error:', e);
+}
+
+function updateSubscriptions() {
+  if (!state.wsReady || state.ws.readyState !== WebSocket.OPEN) return;
+
+  const target = new Set(state.filteredCoins.slice(0, 50).map((c) => c.symbol.toLowerCase()));
+  const toUnsub = [];
+  const toSub = [];
+
+  state.lastSubscriptionSet.forEach((sym) => { if (!target.has(sym)) toUnsub.push(`${sym}@ticker`); });
+  target.forEach((sym) => { if (!state.lastSubscriptionSet.has(sym)) toSub.push(`${sym}@ticker`); });
+
+  if (toUnsub.length) state.ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: toUnsub, id: Date.now() }));
+  if (toSub.length) state.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: toSub, id: Date.now() + 1 }));
+  state.lastSubscriptionSet = target;
+}
+
+function subscribeToKlineStream(symbol) {
+  if (!state.wsReady || state.ws.readyState !== WebSocket.OPEN) return;
+
+  if (state.currentKlineSymbol && state.currentKlineSymbol !== symbol) {
+    state.ws.send(JSON.stringify({
+      method: 'UNSUBSCRIBE',
+      params: [`${state.currentKlineSymbol.toLowerCase()}@kline_${state.currentTimeframe}`],
+      id: Date.now(),
+    }));
+  }
+
+  state.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: [`${symbol.toLowerCase()}@kline_${state.currentTimeframe}`], id: Date.now() + 1 }));
+  state.currentKlineSymbol = symbol;
+}
+
+function updateTicker(data) {
+  const symbol = data.s.toUpperCase();
+  const coin = state.coins.get(symbol);
+  if (!coin) return;
+
+  coin.price = parseFloat(data.c);
+  coin.change = parseFloat(data.P);
+
+  if (symbol === state.currentSymbol) updateHeader(state);
+  const idx = state.filteredCoins.findIndex((c) => c.symbol === symbol);
+  if (idx !== -1) updateCoinRow(coin);
+}
+
+function updateChartWithKline(data) {
+  const k = data.k;
+
+  const newCandle = {
+    timestamp: k.t,
+    open: parseFloat(k.o),
+    high: parseFloat(k.h),
+    low: parseFloat(k.l),
+    close: parseFloat(k.c),
+    volume: parseFloat(k.v)
+  };
+
+  if (state.chartInstance) {
+    state.chartInstance.applyNewData([newCandle]);
+  }
+}
+
+async function refresh30mChanges() {
+  const headerSpan = document.querySelector('#listHeader span[data-sort="change30m"]');
+  const originalText = headerSpan.textContent;
+  headerSpan.textContent = '⏳ 30м';
+
+  const promises = state.filteredCoins.map(async (coin) => {
+    try {
+      const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${coin.symbol}&interval=30m&limit=2`);
+      if (!res.ok) return coin;
+      const klines = await res.json();
+      if (klines.length >= 1) {
+        const lastCandle = klines[klines.length - 1];
+        const open = parseFloat(lastCandle[1]);
+        const close = parseFloat(lastCandle[4]);
+        coin.change30m = ((close - open) / open) * 100;
+      }
+    } catch (_e) {}
+    return coin;
+  });
+
+  await Promise.all(promises);
+  headerSpan.textContent = originalText;
+}
+
+function setupEvents() {
+  document.querySelectorAll('.tf-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setTimeframe(btn.dataset.tf));
+  });
+
+  document.querySelectorAll('#listHeader span').forEach((span) => {
+    span.addEventListener('click', async () => {
+      const field = span.dataset.sort;
+      if (field === 'change30m') await refresh30mChanges();
+      sortBy(field);
+    });
+  });
+
+  document.getElementById('loadMoreBtn').addEventListener('click', loadMoreHistory);
+}
+
+function sortBy(field) {
+  if (state.sortField === field) state.sortDesc = !state.sortDesc;
+  else {
+    state.sortField = field;
+    state.sortDesc = true;
+  }
+
+  sortCoins(state);
+  renderCoinsList(state, selectCoin);
+}
+
+function selectCoin(symbol) {
+  state.currentSymbol = symbol;
+  document.getElementById('currentSymbol').textContent = `${symbol} (${state.currentTimeframe})`;
+
+  document.querySelectorAll('.coin-item').forEach((el) => {
+    el.classList.toggle('active', el.dataset.symbol === symbol);
+  });
+
+  loadChartData(symbol);
+  updateHeader(state);
+}
+
+function setTimeframe(tf) {
+  state.currentTimeframe = tf;
+  document.querySelectorAll('.tf-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tf === tf);
+  });
+
+  document.getElementById('currentSymbol').textContent = `${state.currentSymbol} (${tf})`;
+
+  if (state.chartInstance) {
+    state.chartInstance.setPeriod(mapTimeframeToPeriod(tf));
+  }
+  loadChartData(state.currentSymbol);
+}
+
+init();
