@@ -23,6 +23,7 @@
     // --- ПЕРЕМЕННЫЕ ДЛЯ ЛИКВИДАЦИЙ ---
     const LIQ_MARKERS = new Map();
     const LIQ_VISIBILITY_DURATION = 30000;
+    const MIN_LIQ_COST_USDT = 20000; // порог отрисовки: только ликвидации ≥ 20 000 USDT
     let liquidationWs = null;
 
     // --- ЛОГ ---
@@ -280,9 +281,22 @@
                     const side = order.S;
                     const quantity = parseFloat(order.q);
                     const tradeTime = order.T;
+                    const costUSDT = quantity * price; // оценка объёма в USDT
 
-                    if (symbol !== selectedSymbol) return;
-                    drawLiquidationMarker(price, side, quantity, tradeTime);
+                    const sideText = side === 'SELL' ? 'LONG Liq' : 'SHORT Liq';
+                    const logType = side === 'SELL' ? 'sell' : 'buy';
+
+                    // Всегда пишем в лог
+                    log(
+                        `Ликвидация: ${sideText} ${symbol} по ${formatPrice(price, symbol)} ` +
+                        `(Qty: ${quantity}, $${costUSDT.toFixed(2)})`,
+                        logType
+                    );
+
+                    // На график наносим только ликвидации ≥ 20 000 USDT и только для текущего символа
+                    if (symbol === selectedSymbol && costUSDT >= MIN_LIQ_COST_USDT) {
+                        drawLiquidationMarker(price, side, quantity, tradeTime, costUSDT);
+                    }
                 }
             } catch (err) {
                 console.warn('Ошибка парсинга ликвидации:', err);
@@ -302,22 +316,22 @@
         log(`Запущен поток ликвидаций для ${symbolsArr.length} символов.`);
     }
 
-    function drawLiquidationMarker(price, side, quantity, tradeTime) {
+    function drawLiquidationMarker(price, side, quantity, tradeTime, costUSDT) {
         if (!chart) return;
 
         const lineId = `liq-line-${tradeTime}-${Math.random()}`;
         const annotId = `liq-annot-${tradeTime}-${Math.random()}`;
-        const sideText = side === 'SELL' ? 'LONG Liq' : 'SHORT Liq';
         const shortLabel = side === 'SELL' ? 'L' : 'S';
         const color = side === 'SELL' ? '#ff4d4f' : '#0ecb81';
 
         LIQ_MARKERS.set(`${tradeTime}_${side}`, { lineId, annotId });
 
+        // Линия цены
         chart.createOverlay({
             name: 'priceLine',
             id: lineId,
             points: [{ timestamp: tradeTime, value: price }],
-            extendData: sideText,
+            extendData: `${shortLabel} $${costUSDT.toFixed(0)}`,
             styles: {
                 line: {
                     color: color,
@@ -327,6 +341,7 @@
             }
         });
 
+        // Текстовая аннотация
         chart.createOverlay({
             name: 'simpleAnnotation',
             id: annotId,
@@ -342,8 +357,7 @@
             }
         });
 
-        log(`Ликвидация: ${sideText} ${selectedSymbol} по ${formatPrice(price, selectedSymbol)} (${quantity} шт.)`, side === 'SELL' ? 'sell' : 'buy');
-
+        // Автоудаление через LIQ_VISIBILITY_DURATION
         setTimeout(() => {
             try {
                 chart.removeOverlay(lineId);
