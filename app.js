@@ -264,9 +264,9 @@ window.addEventListener('resize', () => {
   }
 });
 
-// ---------- ЗАГРУЗКА ИСТОРИИ ----------
+// ---------- ЗАГРУЗКА ИСТОРИИ (исправленный URL) ----------
 async function fetchHistory(symbol, interval, limit, signal) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const resp = await fetch(url, { signal });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const raw = await resp.json();
@@ -280,17 +280,14 @@ async function fetchHistory(symbol, interval, limit, signal) {
   }));
 }
 
-// ---------- ОСНОВНАЯ ЗАГРУЗКА ГРАФИКА (создаётся заново) ----------
 let currentFetchController = null;
 
 async function loadChart(symbol, interval) {
-  // Закрываем старый kline-сокет
   if (state.wsChart) {
     state.wsChart.onclose = null;
     state.wsChart.close();
     state.wsChart = null;
   }
-  // Отменяем предыдущую загрузку, если есть
   if (currentFetchController) currentFetchController.abort();
   currentFetchController = new AbortController();
   const { signal } = currentFetchController;
@@ -302,20 +299,15 @@ async function loadChart(symbol, interval) {
     state.currentCandles = history;
     state.oldestTime = history.length > 0 ? history[0].timestamp : null;
 
-    // Пересоздаём график
     initChart();
-
     state.chartInstance.applyNewData(history);
 
-    // Настройка точности
     const lastPrice = history.length ? history[history.length - 1].close : 0;
     const precision = getPricePrecision(lastPrice);
     state.chartInstance.setPriceVolumePrecision(precision, 2);
     state.chartInstance.resize();
 
-    // Подключаем kline-сокет
     connectChartWebSocket(symbol, interval);
-
     updateHeader(state);
   } catch (err) {
     if (err.name === 'AbortError') return;
@@ -328,7 +320,7 @@ async function loadChart(symbol, interval) {
   }
 }
 
-// ---------- WEB SOCKET для свечей (с автопереподключением) ----------
+// ---------- WEB SOCKET ДЛЯ СВЕЧЕЙ ----------
 function connectChartWebSocket(symbol, interval) {
   if (state.wsChart) {
     state.wsChart.onclose = null;
@@ -348,7 +340,6 @@ function connectChartWebSocket(symbol, interval) {
   state.wsChart.onclose = () => {
     console.log('Kline WebSocket closed, reconnecting...');
     setTimeout(() => {
-      // Переподключаемся только если символ и интервал не изменились
       if (state.currentSymbol === symbol && state.currentTimeframe === interval) {
         connectChartWebSocket(symbol, interval);
       }
@@ -357,7 +348,7 @@ function connectChartWebSocket(symbol, interval) {
   state.wsChart.onerror = (e) => console.error('Kline WS error:', e);
 }
 
-// ---------- ОБНОВЛЕНИЕ СВЕЧЕЙ В РЕАЛЬНОМ ВРЕМЕНИ ----------
+// ---------- ОБНОВЛЕНИЕ СВЕЧЕЙ ----------
 function updateChartWithKline(msg) {
   const k = msg.k;
   const candle = {
