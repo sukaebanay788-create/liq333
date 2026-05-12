@@ -306,6 +306,8 @@ async function loadChartData(symbol) {
     state.oldestTime = klines.length > 0 ? klines[0][0] : null;
 
     if (state.chartInstance) {
+      // Сброс ценовой шкалы, чтобы автоскейл пересчитал диапазон под новый символ
+      state.chartInstance.clearPriceScale();
       state.chartInstance.applyNewData(candles);
       state.chartInstance.resize();
     }
@@ -426,7 +428,6 @@ function updateTicker(data) {
   if (idx !== -1) updateCoinRow(coin);
 }
 
-// ГЛАВНОЕ ИСПРАВЛЕНИЕ: правильное обновление свечей в реальном времени
 function updateChartWithKline(data) {
   const k = data.k;
   const candle = {
@@ -447,11 +448,9 @@ function updateChartWithKline(data) {
   const last = state.currentCandles[state.currentCandles.length - 1];
 
   if (candle.timestamp === last.timestamp) {
-    // Обновляем текущую (ещё не закрытую) свечу
     state.currentCandles[state.currentCandles.length - 1] = candle;
     state.chartInstance.updateData(candle);
   } else if (candle.timestamp > last.timestamp) {
-    // Новая свеча
     state.currentCandles.push(candle);
     state.chartInstance.applyMoreData([candle]);
   }
@@ -520,7 +519,6 @@ function selectCoin(symbol) {
   updateHeader(state);
 }
 
-// ИСПРАВЛЕНИЕ: убираем setPeriod, просто перезагружаем данные
 function setTimeframe(tf) {
   state.currentTimeframe = tf;
   document.querySelectorAll('.tf-btn').forEach((btn) => {
