@@ -24,6 +24,14 @@ function formatPrice(price) {
   return price.toFixed(6);
 }
 
+// Новая функция: определяет точность для графика по порядку цены
+function getPricePrecision(price) {
+  if (price >= 1000) return 2;       // BTC, ETH
+  if (price >= 1)    return 4;       // большинство альткоинов
+  if (price >= 0.01) return 5;
+  return 6;                          // очень дешёвые монеты
+}
+
 const state = {
   coins: new Map(),
   filteredCoins: [],
@@ -307,8 +315,10 @@ async function loadChartData(symbol) {
 
     if (state.chartInstance) {
       state.chartInstance.applyNewData(candles);
-      // Устанавливаем точность цены: 4 знака после запятой
-      state.chartInstance.setPriceVolumePrecision(4, 2);
+      // Динамически устанавливаем точность цены по последней цене
+      const lastPrice = candles.length ? candles[candles.length - 1].close : 0;
+      const precision = getPricePrecision(lastPrice);
+      state.chartInstance.setPriceVolumePrecision(precision, 2);
       state.chartInstance.resize();
     }
 
