@@ -1,51 +1,36 @@
-// Дождёмся полной загрузки DOM, чтобы все скрипты точно были готовы
-window.addEventListener('DOMContentLoaded', () => {
-  // Проверим, что библиотека загрузилась
-  if (typeof window.klinecharts === 'undefined') {
-    console.error('KLineChart library not loaded. Check your internet connection or CDN link.');
-    document.getElementById('chart').innerHTML = '<div class="loading">Ошибка загрузки графика</div>';
-    return;
-  }
+// Гарантированная проверка загрузки KLineChart
+if (typeof klinecharts === 'undefined') {
+  document.getElementById('chart').innerHTML = '<div class="loading">Не удалось загрузить библиотеку KLineChart. Проверьте интернет-соединение.</div>';
+  throw new Error('KLineChart library not loaded');
+}
 
-  // Теперь всё инициализируем
-  init();
-});
-
-// Глобальная ссылка на библиотеку
-const klinecharts = window.klinecharts;
-
+// Константы
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
 const BINANCE_API = 'https://fapi.binance.com';
 
-const MAX_MARKERS_PER_SYMBOL = 500;
 const MIN_VOLUME_BTC = 100000;
 const MIN_VOLUME_ETH = 50000;
 const MIN_VOLUME_USD = 10000;
 const STORAGE_PREFIX = 'binance_liq_';
 const MAX_RECENT = 20;
 
+// Вспомогательные функции
 function mapTimeframeToPeriod(tf) {
   const unit = tf.slice(-1);
   const value = parseInt(tf, 10);
   let timespan = 'minute';
   if (unit === 'h') timespan = 'hour';
   else if (unit === 'd') timespan = 'day';
-  else if (unit === 'w') timespan = 'week';
-  else if (unit === 'M') timespan = 'month';
-
   return { multiplier: value, timespan };
 }
 
-function getTimeframeMs(tf) {
-  const unit = tf.slice(-1);
-  const value = parseInt(tf, 10);
-  switch (unit) {
-    case 'm': return value * 60 * 1000;
-    case 'h': return value * 60 * 60 * 1000;
-    default: return 15 * 60 * 1000;
-  }
+function formatPrice(price) {
+  if (price >= 1000) return price.toFixed(2);
+  if (price >= 1) return price.toFixed(4);
+  return price.toFixed(6);
 }
 
+// Хранилище состояния
 const state = {
   coins: new Map(),
   filteredCoins: [],
@@ -67,12 +52,7 @@ const state = {
   recentLiquidations: [],
 };
 
-function formatPrice(price) {
-  if (price >= 1000) return price.toFixed(2);
-  if (price >= 1) return price.toFixed(4);
-  return price.toFixed(6);
-}
-
+// Функции обновления UI (без изменений, но перечислены для полноты)
 function updateHeader(stateObj) {
   const coin = stateObj.coins.get(stateObj.currentSymbol);
   if (!coin) return;
@@ -181,6 +161,7 @@ function updateLiquidationFeed(stateObj, onSelectCoin) {
   });
 }
 
+// Инициализация приложения
 async function init() {
   await loadCoins();
   initChart();
@@ -190,6 +171,7 @@ async function init() {
   loadChartData(state.currentSymbol);
 }
 
+// Загрузка списка монет (без изменений)
 async function loadCoins() {
   try {
     const exchangeInfoRes = await fetch(`${BINANCE_API}/fapi/v1/exchangeInfo`);
@@ -253,9 +235,9 @@ async function loadCoins() {
   }
 }
 
+// Инициализация графика (без индикаторов и маркеров)
 function initChart() {
   const container = document.getElementById('chart');
-  if (!container || !klinecharts) return; // дополнительная защита
 
   state.chartInstance = klinecharts.init(container, {
     symbol: { ticker: 'BTCUSDT' },
@@ -283,6 +265,7 @@ function initChart() {
   });
 }
 
+// WebSocket и ликвидации (только консоль, без графика)
 function connectLiquidationWebSocket() {
   state.liquidationWs = new WebSocket(`${BINANCE_WS_MARKET}/!forceOrder@arr`);
 
@@ -320,13 +303,14 @@ function processLiquidation(order) {
   updateStatusWithCount(state);
 }
 
+// Загрузка свечей и обновление графика
 async function loadChartData(symbol) {
   try {
     const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${state.currentTimeframe}&limit=1400`);
     const klines = await res.json();
 
     const candles = klines.map((k) => ({
-      timestamp: k[0],
+      timestamp: k[0],          // миллисекунды
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
@@ -551,3 +535,8 @@ function setTimeframe(tf) {
   }
   loadChartData(state.currentSymbol);
 }
+
+// Запуск после полной загрузки DOM и KLineChart
+window.addEventListener('DOMContentLoaded', () => {
+  init();
+});
