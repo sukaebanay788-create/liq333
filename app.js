@@ -1,4 +1,3 @@
-// Явная ссылка на глобальный объект KLineChart
 const klinecharts = window.klinecharts;
 
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
@@ -11,7 +10,6 @@ const MIN_VOLUME_USD = 10000;
 const STORAGE_PREFIX = 'binance_liq_';
 const MAX_RECENT = 20;
 
-// Преобразование таймфрейма в формат KLineChart { multiplier, timespan }
 function mapTimeframeToPeriod(tf) {
   const unit = tf.slice(-1);
   const value = parseInt(tf, 10);
@@ -244,46 +242,6 @@ async function loadCoins() {
 function initChart() {
   const container = document.getElementById('chart');
 
-  // Регистрируем оверлей для маркеров ликвидаций
-  klinecharts.registerOverlay({
-    name: 'liquidation_marker',
-    totalStep: 1,
-    needDefaultPointFigure: false,
-    needDefaultXAxisFigure: false,
-    needDefaultYAxisFigure: false,
-    createPointFigures: ({ overlay }) => {
-      const { price, volumeText, isLong } = overlay.extendData || {};
-      if (!price) return [];
-
-      const figures = [];
-      const y = overlay.points[0]?.y;
-
-      if (y !== undefined) {
-        const color = isLong ? '#f6465d' : '#0ecb81';
-        figures.push({
-          type: 'circle',
-          attrs: { x: overlay.points[0].x, y, r: 4 },
-          styles: { color, fillColor: color }
-        });
-
-        if (volumeText) {
-          figures.push({
-            type: 'text',
-            attrs: {
-              x: overlay.points[0].x,
-              y: isLong ? y - 12 : y + 12,
-              text: volumeText,
-              align: 'center'
-            },
-            styles: { color, fontSize: 10 }
-          });
-        }
-      }
-
-      return figures;
-    }
-  });
-
   state.chartInstance = klinecharts.init(container, {
     symbol: { ticker: 'BTCUSDT' },
     period: mapTimeframeToPeriod(state.currentTimeframe),
@@ -302,10 +260,6 @@ function initChart() {
       }
     }
   });
-
-  state.chartInstance.createIndicator('EMA', false, { id: 'ema65', styles: { line: { color: '#a0a4ab' } } }, 65);
-  state.chartInstance.createIndicator('EMA', false, { id: 'ema125', styles: { line: { color: '#a0a4ab' } } }, 125);
-  state.chartInstance.createIndicator('EMA', false, { id: 'ema450', styles: { line: { color: '#e0e3e8' } } }, 450);
 
   window.addEventListener('resize', () => {
     if (state.chartInstance && container) {
@@ -329,37 +283,6 @@ function connectLiquidationWebSocket() {
   state.liquidationWs.onerror = (e) => console.error('Liquidation WS error:', e);
 }
 
-function loadSavedMarkers(symbol) {
-  const saved = localStorage.getItem(STORAGE_PREFIX + symbol);
-  if (!saved) return [];
-
-  try {
-    return JSON.parse(saved);
-  } catch (e) {
-    console.error('Ошибка парсинга сохранённых маркеров:', e);
-    return [];
-  }
-}
-
-function saveMarkers(symbol, markers) {
-  const key = STORAGE_PREFIX + symbol;
-  try {
-    localStorage.setItem(key, JSON.stringify(markers));
-  } catch (e) {
-    console.error('Ошибка сохранения маркеров в localStorage:', e);
-    if (e.name === 'QuotaExceededError') {
-      const keys = Object.keys(localStorage).filter((k) => k.startsWith(STORAGE_PREFIX));
-      keys.sort((a, b) => (localStorage.getItem(a)?.length || 0) - (localStorage.getItem(b)?.length || 0));
-      for (let i = 0; i < Math.min(5, keys.length); i++) localStorage.removeItem(keys[i]);
-      try {
-        localStorage.setItem(key, JSON.stringify(markers));
-      } catch (_e2) {
-        console.error('Повторная ошибка сохранения');
-      }
-    }
-  }
-}
-
 function processLiquidation(order) {
   const symbol = order.s;
   const price = parseFloat(order.p);
@@ -371,63 +294,18 @@ function processLiquidation(order) {
   else if (symbol === 'ETHUSDT') minVol = MIN_VOLUME_ETH;
   if (volumeUSD < minVol) return;
 
-  const isLongLiquidation = order.S === 'SELL';
+  const side = order.S;
+  // Выводим ликвидацию в консоль
+  console.log(`Ликвидация: ${symbol} ${side} ${volumeUSD.toFixed(0)} USD (цена ${price})`);
 
-  const markerData = {
-    time: order.T,
-    price: price,
-    volumeText: `${(volumeUSD / 1000).toFixed(0)}K`,
-    isLong: isLongLiquidation
-  };
-
-  state.recentLiquidations.unshift({ symbol, side: order.S, volume: volumeUSD, price, time: order.T });
+  // Обновляем фид последних ликвидаций
+  state.recentLiquidations.unshift({ symbol, side, volume: volumeUSD, price, time: order.T });
   if (state.recentLiquidations.length > MAX_RECENT) state.recentLiquidations.pop();
   updateLiquidationFeed(state, selectCoin);
 
-  if (!state.allLiquidations.has(symbol)) state.allLiquidations.set(symbol, loadSavedMarkers(symbol));
-  const symbolMarkers = state.allLiquidations.get(symbol);
-
-  const exists = symbolMarkers.some((m) => m.time === markerData.time && m.volumeText === markerData.volumeText);
-  if (!exists) {
-    symbolMarkers.push(markerData);
-    if (symbolMarkers.length > MAX_MARKERS_PER_SYMBOL) symbolMarkers.shift();
-    saveMarkers(symbol, symbolMarkers);
-  }
-
-  if (symbol === state.currentSymbol) {
-    state.liquidationMarkers = symbolMarkers;
-    updateMarkersOnChart();
-    state.liquidationCount = state.liquidationMarkers.length;
-    updateStatusWithCount(state);
-  }
-}
-
-function updateMarkersOnChart() {
-  if (!state.chartInstance) return;
-
-  // Удаляем старые оверлеи ликвидаций
-  const existingOverlays = state.chartInstance.getOverlays?.() || [];
-  existingOverlays.forEach(overlay => {
-    if (overlay.name === 'liquidation_marker') {
-      state.chartInstance.removeOverlay(overlay.id);
-    }
-  });
-
-  // Добавляем новые
-  state.liquidationMarkers.forEach(marker => {
-    if (!state.chartInstance) return;
-
-    state.chartInstance.addOverlay('liquidation_marker', {
-      timestamp: marker.time,
-      value: marker.price
-    }, {
-      extendData: {
-        price: marker.price,
-        volumeText: marker.volumeText,
-        isLong: marker.isLong
-      }
-    });
-  });
+  // Увеличиваем счётчик ликвидаций для статуса (без отрисовки на графике)
+  state.liquidationCount++;
+  updateStatusWithCount(state);
 }
 
 async function loadChartData(symbol) {
@@ -436,7 +314,7 @@ async function loadChartData(symbol) {
     const klines = await res.json();
 
     const candles = klines.map((k) => ({
-      timestamp: k[0],          // миллисекунды
+      timestamp: k[0],
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
@@ -447,17 +325,10 @@ async function loadChartData(symbol) {
     state.currentCandles = candles;
     state.oldestTime = klines.length > 0 ? klines[0][0] : null;
 
-    // Применяем данные и пересчитываем размер графика
     if (state.chartInstance) {
       state.chartInstance.applyNewData(candles);
       state.chartInstance.resize();
     }
-
-    if (!state.allLiquidations.has(symbol)) state.allLiquidations.set(symbol, loadSavedMarkers(symbol));
-    state.liquidationMarkers = state.allLiquidations.get(symbol) || [];
-    updateMarkersOnChart();
-    state.liquidationCount = state.liquidationMarkers.length;
-    updateStatusWithCount(state);
 
     if (state.wsReady) subscribeToKlineStream(symbol);
     updateHeader(state);
@@ -495,8 +366,6 @@ async function loadMoreHistory() {
     if (state.chartInstance) {
       state.chartInstance.applyNewData(state.currentCandles);
     }
-
-    updateMarkersOnChart();
   } catch (e) {
     console.error('Ошибка подгрузки истории:', e);
   } finally {
