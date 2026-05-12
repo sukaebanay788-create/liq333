@@ -1,10 +1,5 @@
-// Гарантированная проверка загрузки KLineChart
-if (typeof klinecharts === 'undefined') {
-  document.getElementById('chart').innerHTML = '<div class="loading">Не удалось загрузить библиотеку KLineChart. Проверьте интернет-соединение.</div>';
-  throw new Error('KLineChart library not loaded');
-}
+const klinecharts = window.klinecharts;
 
-// Константы
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
 const BINANCE_API = 'https://fapi.binance.com';
 
@@ -14,7 +9,6 @@ const MIN_VOLUME_USD = 10000;
 const STORAGE_PREFIX = 'binance_liq_';
 const MAX_RECENT = 20;
 
-// Вспомогательные функции
 function mapTimeframeToPeriod(tf) {
   const unit = tf.slice(-1);
   const value = parseInt(tf, 10);
@@ -30,7 +24,6 @@ function formatPrice(price) {
   return price.toFixed(6);
 }
 
-// Хранилище состояния
 const state = {
   coins: new Map(),
   filteredCoins: [],
@@ -52,7 +45,6 @@ const state = {
   recentLiquidations: [],
 };
 
-// Функции обновления UI (без изменений, но перечислены для полноты)
 function updateHeader(stateObj) {
   const coin = stateObj.coins.get(stateObj.currentSymbol);
   if (!coin) return;
@@ -161,7 +153,6 @@ function updateLiquidationFeed(stateObj, onSelectCoin) {
   });
 }
 
-// Инициализация приложения
 async function init() {
   await loadCoins();
   initChart();
@@ -171,7 +162,6 @@ async function init() {
   loadChartData(state.currentSymbol);
 }
 
-// Загрузка списка монет (без изменений)
 async function loadCoins() {
   try {
     const exchangeInfoRes = await fetch(`${BINANCE_API}/fapi/v1/exchangeInfo`);
@@ -235,13 +225,9 @@ async function loadCoins() {
   }
 }
 
-// Инициализация графика (без индикаторов и маркеров)
 function initChart() {
   const container = document.getElementById('chart');
-
   state.chartInstance = klinecharts.init(container, {
-    symbol: { ticker: 'BTCUSDT' },
-    period: mapTimeframeToPeriod(state.currentTimeframe),
     styles: {
       grid: {
         horizontal: { color: '#1e2329' },
@@ -265,7 +251,6 @@ function initChart() {
   });
 }
 
-// WebSocket и ликвидации (только консоль, без графика)
 function connectLiquidationWebSocket() {
   state.liquidationWs = new WebSocket(`${BINANCE_WS_MARKET}/!forceOrder@arr`);
 
@@ -303,14 +288,13 @@ function processLiquidation(order) {
   updateStatusWithCount(state);
 }
 
-// Загрузка свечей и обновление графика
 async function loadChartData(symbol) {
   try {
     const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${state.currentTimeframe}&limit=1400`);
     const klines = await res.json();
 
     const candles = klines.map((k) => ({
-      timestamp: k[0],          // миллисекунды
+      timestamp: k[0],
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
@@ -442,10 +426,10 @@ function updateTicker(data) {
   if (idx !== -1) updateCoinRow(coin);
 }
 
+// ГЛАВНОЕ ИСПРАВЛЕНИЕ: правильное обновление свечей в реальном времени
 function updateChartWithKline(data) {
   const k = data.k;
-
-  const newCandle = {
+  const candle = {
     timestamp: k.t,
     open: parseFloat(k.o),
     high: parseFloat(k.h),
@@ -454,8 +438,22 @@ function updateChartWithKline(data) {
     volume: parseFloat(k.v)
   };
 
-  if (state.chartInstance) {
-    state.chartInstance.applyNewData([newCandle]);
+  if (!state.currentCandles.length) {
+    state.currentCandles.push(candle);
+    state.chartInstance.applyNewData([candle]);
+    return;
+  }
+
+  const last = state.currentCandles[state.currentCandles.length - 1];
+
+  if (candle.timestamp === last.timestamp) {
+    // Обновляем текущую (ещё не закрытую) свечу
+    state.currentCandles[state.currentCandles.length - 1] = candle;
+    state.chartInstance.updateData(candle);
+  } else if (candle.timestamp > last.timestamp) {
+    // Новая свеча
+    state.currentCandles.push(candle);
+    state.chartInstance.applyMoreData([candle]);
   }
 }
 
@@ -522,6 +520,7 @@ function selectCoin(symbol) {
   updateHeader(state);
 }
 
+// ИСПРАВЛЕНИЕ: убираем setPeriod, просто перезагружаем данные
 function setTimeframe(tf) {
   state.currentTimeframe = tf;
   document.querySelectorAll('.tf-btn').forEach((btn) => {
@@ -529,14 +528,7 @@ function setTimeframe(tf) {
   });
 
   document.getElementById('currentSymbol').textContent = `${state.currentSymbol} (${tf})`;
-
-  if (state.chartInstance) {
-    state.chartInstance.setPeriod(mapTimeframeToPeriod(tf));
-  }
   loadChartData(state.currentSymbol);
 }
 
-// Запуск после полной загрузки DOM и KLineChart
-window.addEventListener('DOMContentLoaded', () => {
-  init();
-});
+init();
