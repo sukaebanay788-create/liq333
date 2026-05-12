@@ -259,7 +259,7 @@
         };
     }
 
-    // --- ПОТОК ЛИКВИДАЦИЙ ---
+    // --- ПОТОК ЛИКВИДАЦИЙ (исправленный URL) ---
     function startLiquidationStream(symbolsArr) {
         if (liquidationWs) {
             liquidationWs.onclose = null;
@@ -268,7 +268,8 @@
         }
 
         const streams = symbolsArr.map(s => `${s.toLowerCase()}@forceOrder`).join('/');
-        const wsUrl = `wss://fstream.binance.com/stream?streams=${streams}`;
+        // НОВЫЙ ПРАВИЛЬНЫЙ ЭНДПОИНТ ДЛЯ РЫНОЧНЫХ ДАННЫХ
+        const wsUrl = `wss://fstream.binance.com/market/stream?streams=${streams}`;
         liquidationWs = new WebSocket(wsUrl);
 
         liquidationWs.onmessage = (event) => {
@@ -281,7 +282,7 @@
                     const side = order.S;
                     const quantity = parseFloat(order.q);
                     const tradeTime = order.T;
-                    const costUSDT = quantity * price; // оценка объёма в USDT
+                    const costUSDT = quantity * price;
 
                     const sideText = side === 'SELL' ? 'LONG Liq' : 'SHORT Liq';
                     const logType = side === 'SELL' ? 'sell' : 'buy';
