@@ -1,3 +1,17 @@
+// Дождёмся полной загрузки DOM, чтобы все скрипты точно были готовы
+window.addEventListener('DOMContentLoaded', () => {
+  // Проверим, что библиотека загрузилась
+  if (typeof window.klinecharts === 'undefined') {
+    console.error('KLineChart library not loaded. Check your internet connection or CDN link.');
+    document.getElementById('chart').innerHTML = '<div class="loading">Ошибка загрузки графика</div>';
+    return;
+  }
+
+  // Теперь всё инициализируем
+  init();
+});
+
+// Глобальная ссылка на библиотеку
 const klinecharts = window.klinecharts;
 
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
@@ -241,6 +255,7 @@ async function loadCoins() {
 
 function initChart() {
   const container = document.getElementById('chart');
+  if (!container || !klinecharts) return; // дополнительная защита
 
   state.chartInstance = klinecharts.init(container, {
     symbol: { ticker: 'BTCUSDT' },
@@ -295,15 +310,12 @@ function processLiquidation(order) {
   if (volumeUSD < minVol) return;
 
   const side = order.S;
-  // Выводим ликвидацию в консоль
   console.log(`Ликвидация: ${symbol} ${side} ${volumeUSD.toFixed(0)} USD (цена ${price})`);
 
-  // Обновляем фид последних ликвидаций
   state.recentLiquidations.unshift({ symbol, side, volume: volumeUSD, price, time: order.T });
   if (state.recentLiquidations.length > MAX_RECENT) state.recentLiquidations.pop();
   updateLiquidationFeed(state, selectCoin);
 
-  // Увеличиваем счётчик ликвидаций для статуса (без отрисовки на графике)
   state.liquidationCount++;
   updateStatusWithCount(state);
 }
@@ -539,5 +551,3 @@ function setTimeframe(tf) {
   }
   loadChartData(state.currentSymbol);
 }
-
-init();
