@@ -2,6 +2,7 @@ const klinecharts = window.klinecharts;
 
 const BINANCE_WS_MARKET = 'wss://fstream.binance.com/market/ws';
 const BINANCE_API = 'https://fapi.binance.com';
+const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws';  // Для отдельных kline-стримов
 
 const MIN_VOLUME_BTC = 100000;
 const MIN_VOLUME_ETH = 50000;
@@ -24,12 +25,11 @@ function formatPrice(price) {
   return price.toFixed(6);
 }
 
-// Новая функция: определяет точность для графика по порядку цены
 function getPricePrecision(price) {
-  if (price >= 1000) return 2;       // BTC, ETH
-  if (price >= 1)    return 4;       // большинство альткоинов
+  if (price >= 1000) return 2;
+  if (price >= 1)    return 4;
   if (price >= 0.01) return 5;
-  return 6;                          // очень дешёвые монеты
+  return 6;
 }
 
 const state = {
@@ -38,13 +38,13 @@ const state = {
   currentSymbol: 'BTCUSDT',
   ws: null,
   wsReady: false,
+  wsChart: null,              // Отдельный WebSocket для kline
   liquidationWs: null,
   chartInstance: null,
   sortField: 'change',
   sortDesc: true,
   currentTimeframe: '15m',
   lastSubscriptionSet: new Set(),
-  currentKlineSymbol: null,
   oldestTime: null,
   isLoadingMore: false,
   liquidationMarkers: [],
@@ -296,6 +296,34 @@ function processLiquidation(order) {
   updateStatusWithCount(state);
 }
 
+// ---------- Управление отдельным kline-соединением ----------
+function closeChartWebSocket() {
+  if (state.wsChart) {
+    state.wsChart.onclose = null;  // отключаем автопереподключение
+    state.wsChart.close();
+    state.wsChart = null;
+  }
+}
+
+function connectChartWebSocket(symbol, interval) {
+  closeChartWebSocket(); // гарантированно закрываем предыдущее
+
+  const wsUrl = `${BINANCE_WS_BASE}/${symbol.toLowerCase()}@kline_${interval}`;
+  state.wsChart = new WebSocket(wsUrl);
+
+  state.wsChart.onopen = () => console.log('Kline WebSocket открыт');
+  state.wsChart.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.e === 'kline') updateChartWithKline(msg);
+  };
+  state.wsChart.onclose = () => {
+    console.log('Kline WebSocket закрыт');
+    // Не переподключаемся здесь — новая подписка создастся при следующей загрузке
+  };
+  state.wsChart.onerror = (e) => console.error('Kline WS error:', e);
+}
+
+// ---------- Загрузка данных ----------
 async function loadChartData(symbol) {
   try {
     const res = await fetch(`${BINANCE_API}/fapi/v1/klines?symbol=${symbol}&interval=${state.currentTimeframe}&limit=1400`);
@@ -314,15 +342,17 @@ async function loadChartData(symbol) {
     state.oldestTime = klines.length > 0 ? klines[0][0] : null;
 
     if (state.chartInstance) {
-      state.chartInstance.applyNewData(candles);
-      // Динамически устанавливаем точность цены по последней цене
+      // Динамически устанавливаем точность цены
       const lastPrice = candles.length ? candles[candles.length - 1].close : 0;
       const precision = getPricePrecision(lastPrice);
+
+      state.chartInstance.applyNewData(candles);
       state.chartInstance.setPriceVolumePrecision(precision, 2);
       state.chartInstance.resize();
     }
 
-    if (state.wsReady) subscribeToKlineStream(symbol);
+    // Подключаем выделенный kline-WebSocket для этого symbol/interval
+    connectChartWebSocket(symbol, state.currentTimeframe);
     updateHeader(state);
   } catch (e) {
     console.error('Ошибка загрузки графика:', e);
@@ -374,21 +404,20 @@ function connectWebSocket() {
     state.wsReady = true;
     updateConnectionStatus(state, true);
     updateSubscriptions();
-    if (state.currentSymbol) subscribeToKlineStream(state.currentSymbol);
+    // Запускаем kline-подписку отдельно в loadChartData
   };
 
   state.ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
     if (msg.id) return;
     if (msg.e === '24hrTicker') updateTicker(msg);
-    else if (msg.e === 'kline') updateChartWithKline(msg);
+    // kline-сообщения больше не обрабатываем здесь — у нас свой WebSocket
   };
 
   state.ws.onclose = () => {
     state.wsReady = false;
     updateConnectionStatus(state, false);
     state.lastSubscriptionSet.clear();
-    state.currentKlineSymbol = null;
     setTimeout(connectWebSocket, 5000);
   };
 
@@ -410,21 +439,6 @@ function updateSubscriptions() {
   state.lastSubscriptionSet = target;
 }
 
-function subscribeToKlineStream(symbol) {
-  if (!state.wsReady || state.ws.readyState !== WebSocket.OPEN) return;
-
-  if (state.currentKlineSymbol && state.currentKlineSymbol !== symbol) {
-    state.ws.send(JSON.stringify({
-      method: 'UNSUBSCRIBE',
-      params: [`${state.currentKlineSymbol.toLowerCase()}@kline_${state.currentTimeframe}`],
-      id: Date.now(),
-    }));
-  }
-
-  state.ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: [`${symbol.toLowerCase()}@kline_${state.currentTimeframe}`], id: Date.now() + 1 }));
-  state.currentKlineSymbol = symbol;
-}
-
 function updateTicker(data) {
   const symbol = data.s.toUpperCase();
   const coin = state.coins.get(symbol);
@@ -438,6 +452,7 @@ function updateTicker(data) {
   if (idx !== -1) updateCoinRow(coin);
 }
 
+// ---------- Обновление свечей (только из выделенного kline-соединения) ----------
 function updateChartWithKline(data) {
   const k = data.k;
   const candle = {
